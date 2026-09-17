@@ -1,0 +1,76 @@
+:root {
+  --bg-base: #0a0a0a;
+  --bg-surface: #1a1a1a;
+  --bg-elevated: #242424;
+  --border-color: #2a2a2a;
+  --text-primary: #e0e0e0;
+  --text-secondary: #a0a0a0;
+  --accent: #22d3ee;
+  --accent-hover: #06b6d4;
+  --danger: #ef4444;
+  --success: #22c55e;
+  --warning: #f59e0b;
+}
+
+html, body, #app {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+// Element Plus OLED dark overrides
+.el-menu {
+  background-color: var(--bg-base) !important;
+  border-right-color: var(--border-color) !important;
+}
+.el-menu-item, .el-sub-menu__title {
+  color: var(--text-secondary) !important;
+  &:hover, &:focus {
+    background-color: var(--bg-surface) !important;
+    color: var(--accent) !important;
+  }
+  &.is-active {
+    color: var(--accent) !important;
+  }
+}
+.el-aside {
+  background: var(--bg-base);
+  border-right: 1px solid var(--border-color);
+}
+.el-header {
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-color);
+}
+.el-main {
+  background: var(--bg-base);
+}
+.el-card {
+  background: var(--bg-surface) !important;
+  border-color: var(--border-color) !important;
+  color: var(--text-primary) !important;
+}
+.el-input__wrapper {
+  background-color: var(--bg-surface) !important;
+  box-shadow: 0 0 0 1px var(--border-color) inset !important;
+}
+.el-input__inner {
+  color: var(--text-primary) !important;
+}
+.el-button--primary {
+  --el-button-bg-color: var(--accent);
+  --el-button-border-color: var(--accent);
+  --el-button-hover-bg-color: var(--accent-hover);
+  --el-button-hover-border-color: var(--accent-hover);
+}
+.el-table {
+  --el-table-bg-color: var(--bg-surface);
+  --el-table-tr-bg-color: var(--bg-surface);
+  --el-table-header-bg-color: var(--bg-elevated);
+  --el-table-row-hover-bg-color: var(--bg-elevated);
+  --el-table-border-color: var(--border-color);
+  --el-table-text-color: var(--text-primary);
+  --el-table-header-text-color: var(--text-secondary);
+}

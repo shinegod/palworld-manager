@@ -1,0 +1,30 @@
+services:
+  palworld:
+    image: thijsvanloef/palworld-server-docker:latest
+    platform: linux/amd64
+    container_name: palworld-dev
+    ports:
+      - "8211:8211/udp"    # 游戏端口
+      - "8212:8212/tcp"    # REST API
+      - "25575:25575/tcp"  # RCON
+      - "13335:13335/tcp"  # PalHook API
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - PORT=8211
+      - PLAYERS=4
+      - MULTITHREADING=true
+      - RCON_ENABLED=true
+      - RCON_PORT=25575
+      - ADMIN_PASSWORD=changeme
+      - COMMUNITY=false
+      - SERVER_NAME=PalHook-Dev
+      - REST_API_ENABLED=true
+      - REST_API_PORT=8212
+    volumes:
+      - palworld-data:/palworld
+      - ./palhook:/palhook    # 挂载palhook源码
+    restart: unless-stopped
+
+volumes:
+  palworld-data:

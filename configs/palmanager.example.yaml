@@ -1,0 +1,41 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+auth:
+  username: "admin"
+  password: "changeme"
+  jwt_secret: "change-this-to-a-random-string"
+  token_expire_hours: 24
+
+palworld:
+  api_url: "http://127.0.0.1:8212"
+  api_user: "admin"
+  api_password: ""
+  gamedata_enabled: false
+
+rcon:
+  host: "127.0.0.1"
+  port: 25575
+  password: ""
+  enabled: true
+
+# PalHook 注入库 (在线刷道具/帕鲁/经验, 也可在面板 设置→连接配置 中填写)
+palhook:
+  url: "http://127.0.0.1:13335"
+  password: ""
+
+database:
+  path: "./data/palmanager.db"
+
+scheduler:
+  auto_restart_enabled: false
+  auto_restart_interval_hours: 6
+  restart_warning_minutes: [5, 3, 1]
+  auto_backup_enabled: false
+  auto_backup_interval_hours: 1
+  backup_retention_count: 48
+
+metrics:
+  poll_interval_seconds: 10
+  retention_hours: 168

@@ -1,0 +1,55 @@
+# ── Binaries / build artifacts ──
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/palmanager
+/palworld-save-reader
+/libUE4SS.so
+/ue4ss-linux-v3.0.2.tar.gz
+
+# ── Go ──
+vendor/
+*.test
+*.out
+go.work
+go.work.sum
+
+# ── Frontend ──
+web/node_modules/
+web/dist/
+# 地图瓦片 (121MB, 可选资源; 不提交则地图页无底图, 点位仍显示)
+web/public/map/tiles/
+
+# ── Data / DB ──
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# ── Secrets ──
+palhook/DEPLOY.md
+configs/test.yaml
+.env
+.env.local
+.env.*.local
+
+# ── Third-party / tooling ──
+/palworld-server-tool/
+/.playwright-mcp/
+/.claude/
+
+# ── IDE / OS ──
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Config (keep examples only) ──
+configs/palmanager.yaml
+configs/palbridge.yaml
