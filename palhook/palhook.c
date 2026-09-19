@@ -29,7 +29,7 @@
 #include <sys/syscall.h>
 
 #define PALHOOK_PORT 13335
-#define PALHOOK_VERSION "0.9.9"
+#define PALHOOK_VERSION "0.9.10"
 #define MAX_REQUEST 16384
 #define MAX_RESPONSE 262144
 #define LOG_PREFIX "[PalHook] "
@@ -4784,9 +4784,10 @@ static int match_ipv4_wide(uint8_t* base, int start, int max_off, char* out, int
 
 /* 从自建params缓冲读FString (缓冲是malloc的, 不做region检查) */
 
-/* UPalPlayerAccount缓存: uid -> 平台名 */
-static char g_acc_uid[MAX_PLAYER_CACHE][64];
-static char g_acc_platform[MAX_PLAYER_CACHE][32];
+/* UPalPlayerAccount缓存: uid -> 平台名 (生产服历史账号多, 上限256) */
+#define MAX_ACC_CACHE 256
+static char g_acc_uid[MAX_ACC_CACHE][64];
+static char g_acc_platform[MAX_ACC_CACHE][32];
 static int g_acc_count = 0;
 static time_t g_acc_ts = 0;
 
@@ -4797,10 +4798,10 @@ static void collect_player_accounts(void) {
     if (fi <= 0) { g_acc_ts = time(NULL); return; }
     uintptr_t segs[MAX_RW_REGIONS][2];
     int seg_count = snapshot_rw(segs, MAX_RW_REGIONS);
-    for (int seg = 0; seg < seg_count && g_acc_count < MAX_PLAYER_CACHE; seg++) {
+    for (int seg = 0; seg < seg_count && g_acc_count < MAX_ACC_CACHE; seg++) {
         uintptr_t* ptr = (uintptr_t*)segs[seg][0];
         size_t cnt = (segs[seg][1] - segs[seg][0]) / sizeof(uintptr_t);
-        for (size_t i = 0; i < cnt && g_acc_count < MAX_PLAYER_CACHE; i++) {
+        for (size_t i = 0; i < cnt && g_acc_count < MAX_ACC_CACHE; i++) {
             uintptr_t val = ptr[i];
             if (val < 0x10000 || val > 0x800000000000UL) continue;
             uintptr_t ov = 0;

@@ -27,10 +27,22 @@
               <span :class="pingClass(row.ping)">{{ Math.round(row.ping) }}ms</span>
             </template>
           </el-table-column>
-          <el-table-column prop="iP" label="IP" min-width="140" />
+          <el-table-column label="IP / 归属地" min-width="230">
+            <template #default="{ row }">
+              <div class="ip-cell">
+                <span class="ip-line">
+                  <span v-if="flagEmoji(ipInfos[row.iP]?.countryCode)" class="flag">{{ flagEmoji(ipInfos[row.iP]?.countryCode) }}</span>
+                  <span class="mono">{{ row.iP || '-' }}</span>
+                </span>
+                <span v-if="ipInfos[row.iP]?.country" class="ip-geo">
+                  {{ ipInfos[row.iP].country }} {{ ipInfos[row.iP].regionName || '' }} {{ ipInfos[row.iP].city || '' }} · {{ ipInfos[row.iP].isp || '' }}
+                </span>
+              </div>
+            </template>
+          </el-table-column>
           <el-table-column label="平台" width="100" align="center">
             <template #default="{ row }">
-              <el-tag size="small" type="info">{{ guessPlatform(row.userId) }}</el-tag>
+              <el-tag size="small" :type="row.platform === 'Steam' ? 'success' : 'info'">{{ row.platform || guessPlatform(row.userId) }}</el-tag>
             </template>
           </el-table-column>
           <el-table-column label="操作" width="130" align="center">
@@ -285,6 +297,7 @@ interface OnlinePlayer {
   playerId: string
   userId: string
   iP: string
+  platform: string
   ping: number
   location_x: number
   location_y: number
@@ -394,6 +407,27 @@ function pingClass(ping: number): string {
   return 'ping-bad'
 }
 
+const ipInfos = ref<Record<string, any>>({})
+
+async function fetchIpInfos() {
+  const ips = Array.from(new Set(onlinePlayers.value.map((p) => p.iP).filter((ip) => ip && ip !== '0.0.0.0')))
+  for (const ip of ips) {
+    try {
+      const res = await http.get('/ipinfo', { params: { ip }, timeout: 8000 })
+      if (res.data?.country) {
+        ipInfos.value[ip] = res.data
+      }
+    } catch {
+      // ignore single failures
+    }
+  }
+}
+
+function flagEmoji(cc?: string): string {
+  if (!cc || cc.length !== 2) return ''
+  return String.fromCodePoint(...Array.from(cc.toUpperCase()).map((c) => 127397 + c.charCodeAt(0)))
+}
+
 function guessPlatform(userId: string): string {
   if (userId.startsWith('steam_')) return 'Steam'
   if (userId.startsWith('xbox_')) return 'Xbox'
@@ -416,6 +450,7 @@ async function fetchOnline() {
   try {
     const res = await http.get<OnlinePlayer[]>('/players/online')
     onlinePlayers.value = res.data ?? []
+    fetchIpInfos()
   } catch {
     // REST不可用时从PalHook兜底
     try {
@@ -433,6 +468,7 @@ async function fetchOnline() {
         location_z: p.z,
         level: p.level,
       }))
+      fetchIpInfos()
     } catch {
       ElMessage.error('获取在线玩家失败')
     }
@@ -748,6 +784,10 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+.ip-cell { display: flex; flex-direction: column; line-height: 1.5; }
+.ip-line { display: flex; align-items: center; gap: 6px; }
+.flag { font-size: 16px; }
+.ip-geo { font-size: 12px; color: var(--text-secondary); }
 .players-page {
   color: var(--text-primary);
 }

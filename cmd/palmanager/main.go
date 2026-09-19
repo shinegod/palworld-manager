@@ -56,6 +56,7 @@ func main() {
 	palhookHandler := handler.NewPalHookHandler(configStore)
 	hookPlayers := handler.NewPalHookPlayersHandler(configStore, banStore, playerStore)
 	hookDash := handler.NewHookDashboardHandler(configStore)
+	ipInfo := handler.NewIPInfoHandler()
 
 	// Router
 	gin.SetMode(gin.ReleaseMode)
@@ -106,6 +107,9 @@ func main() {
 
 		// Map (PalHook /players 坐标)
 		api.GET("/map/players", hookDash.GetPlayerPositions)
+
+		// IP 归属地 (后端代理查询, 带缓存)
+		api.GET("/ipinfo", ipInfo.Get)
 
 		// PalHook 直连代理 (在线管理操作)
 		api.GET("/palhook/health", palhookHandler.Health)
