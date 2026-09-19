@@ -177,7 +177,7 @@ onMounted(() => {
   store.fetchRealtime()
   refreshTimer = setInterval(() => {
     store.fetchRealtime()
-  }, 10000)
+  }, 20000)
 })
 
 onUnmounted(() => {

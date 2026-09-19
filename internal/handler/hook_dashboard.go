@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -44,28 +45,44 @@ func (h *HookDashboardHandler) hookGet(path string) ([]byte, int, error) {
 	return body, resp.StatusCode, nil
 }
 
-// GetRealtime 合并 PalHook /metrics 与 /players
+// GetRealtime 合并 PalHook /metrics 与 /players (并行请求, 减少串行等待)
 func (h *HookDashboardHandler) GetRealtime(c *gin.Context) {
 	if !h.configured() {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "PalHook未配置，请在 设置→连接配置 中填写 PalHook 地址"})
 		return
 	}
-	metrics := map[string]any{}
-	mb, code, err := h.hookGet("/metrics")
-	if err != nil || code != http.StatusOK || json.Unmarshal(mb, &metrics) != nil {
-		metrics = map[string]any{}
+	type rtResult struct {
+		metrics map[string]any
+		players []any
 	}
-	players := []any{}
-	pb, pcode, _ := h.hookGet("/players")
-	if pcode == http.StatusOK {
-		var pr struct {
-			Players []any `json:"players"`
+	var res rtResult
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		metrics := map[string]any{}
+		mb, code, err := h.hookGet("/metrics")
+		if err != nil || code != http.StatusOK || json.Unmarshal(mb, &metrics) != nil {
+			metrics = map[string]any{}
 		}
-		if json.Unmarshal(pb, &pr) == nil && pr.Players != nil {
-			players = pr.Players
+		res.metrics = metrics
+	}()
+	go func() {
+		defer wg.Done()
+		players := []any{}
+		pb, pcode, _ := h.hookGet("/players")
+		if pcode == http.StatusOK {
+			var pr struct {
+				Players []any `json:"players"`
+			}
+			if json.Unmarshal(pb, &pr) == nil && pr.Players != nil {
+				players = pr.Players
+			}
 		}
-	}
-	c.JSON(http.StatusOK, gin.H{"metrics": metrics, "players": players})
+		res.players = players
+	}()
+	wg.Wait()
+	c.JSON(http.StatusOK, gin.H{"metrics": res.metrics, "players": res.players})
 }
 
 // GetInfo 服务器基本信息 (来自 PalHook /health)

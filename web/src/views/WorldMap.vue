@@ -165,7 +165,7 @@ let timer: ReturnType<typeof setInterval> | null = null
 onMounted(() => {
   fetchPlayers()
   loadPOI()
-  timer = setInterval(fetchPlayers, 10000)
+  timer = setInterval(fetchPlayers, 20000)
 })
 
 onUnmounted(() => {

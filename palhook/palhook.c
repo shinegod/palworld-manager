@@ -29,7 +29,7 @@
 #include <sys/syscall.h>
 
 #define PALHOOK_PORT 13335
-#define PALHOOK_VERSION "0.9.10"
+#define PALHOOK_VERSION "0.9.11"
 #define MAX_REQUEST 16384
 #define MAX_RESPONSE 262144
 #define LOG_PREFIX "[PalHook] "
@@ -4668,6 +4668,7 @@ static int get_connected_playerstates(uintptr_t* out, int max_n) {
     if (safe_read_ptr(g_cache_gamestate + off + 8, &num_raw) != 0) return 0;
     int num = (int)(num_raw & 0xFFFFFFFF);
     if (num <= 0 || num > 64 || dptr < 0x10000 || !region_contains(dptr)) return 0;
+    if (!out) return num; /* 只计数 */
     if (num > max_n) num = max_n;
     for (int i = 0; i < num; i++) {
         uintptr_t p = 0;
@@ -4677,7 +4678,16 @@ static int get_connected_playerstates(uintptr_t* out, int max_n) {
     return num;
 }
 
+static pthread_mutex_t g_collect_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* 有线程正在全内存扫描时, 其他请求直接复用旧缓存 (避免并发扫描打满CPU) */
 static int collect_all_players(void) {
+    if (g_players_ts != 0 && time(NULL) - g_players_ts < 20) return g_players_count;
+    if (pthread_mutex_trylock(&g_collect_lock) != 0) return g_players_count;
+    if (g_players_ts != 0 && time(NULL) - g_players_ts < 20) {
+        pthread_mutex_unlock(&g_collect_lock);
+        return g_players_count;
+    }
     install_segv_handler();
     g_players_count = 0;
     const char* classes[] = {"BP_Player_Female_C", "BP_Player_Male_C", NULL};
@@ -4761,7 +4771,9 @@ static int collect_all_players(void) {
         }
     }
     g_players_ts = time(NULL);
-    return g_players_count;
+    int result = g_players_count;
+    pthread_mutex_unlock(&g_collect_lock);
+    return result;
 }
 
 /* 补充玩家详细信息 (名字/UID/等级/经验/坐标) */
@@ -4791,8 +4803,12 @@ static char g_acc_platform[MAX_ACC_CACHE][32];
 static int g_acc_count = 0;
 static time_t g_acc_ts = 0;
 
+static pthread_mutex_t g_acc_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static void collect_player_accounts(void) {
-    if (g_acc_ts != 0 && time(NULL) - g_acc_ts < 20) return;
+    /* 平台信息几乎不变: TTL拉到120秒, 且并发时复用已有结果 */
+    if (g_acc_ts != 0 && time(NULL) - g_acc_ts < 120) return;
+    if (pthread_mutex_trylock(&g_acc_lock) != 0) return;
     g_acc_count = 0;
     int fi = find_fname_index("PalPlayerAccount");
     if (fi <= 0) { g_acc_ts = time(NULL); return; }
@@ -4836,6 +4852,7 @@ static void collect_player_accounts(void) {
         }
     }
     g_acc_ts = time(NULL);
+    pthread_mutex_unlock(&g_acc_lock);
     palhook_log("collect_player_accounts: %d accounts", g_acc_count);
 }
 
@@ -5181,13 +5198,14 @@ static void api_kick(int fd, const char* req) {
 /* GET /metrics — 运行指标: 玩家数/fps估算/运行时间 */
 static void api_metrics(int fd, const char* req) {
     (void)req;
-    if (g_players_ts == 0 || time(NULL) - g_players_ts > 20) {
-        collect_all_players();
-    }
+    /* 速度优化: 玩家数直接读 GameState->PlayerArray (无全内存扫描, 毫秒级)
+     * 兜底: PlayerArray不可用时用玩家缓存计数 */
+    int pc = get_connected_playerstates(NULL, 0);
+    if (pc <= 0 && g_players_count > 0) pc = g_players_count;
     char buf[512];
     snprintf(buf, sizeof(buf),
         "{\"status\":\"ok\",\"player_count\":%d,\"fps\":%d,\"uptime_sec\":%ld,\"version\":\"%s\"}",
-        g_players_count, g_fps, (long)(time(NULL) - g_start_ts), PALHOOK_VERSION);
+        pc, g_fps, (long)(time(NULL) - g_start_ts), PALHOOK_VERSION);
     json_ok(fd, buf);
 }
 
