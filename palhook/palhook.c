@@ -29,7 +29,7 @@
 #include <sys/syscall.h>
 
 #define PALHOOK_PORT 13335
-#define PALHOOK_VERSION "0.9.12"
+#define PALHOOK_VERSION "0.9.14"
 #define MAX_REQUEST 16384
 #define MAX_RESPONSE 262144
 #define LOG_PREFIX "[PalHook] "
@@ -4681,14 +4681,56 @@ static int get_connected_playerstates(uintptr_t* out, int max_n) {
 
 static pthread_mutex_t g_collect_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* 有线程正在全内存扫描时, 其他请求直接复用旧缓存 (避免并发扫描打满CPU) */
-static int collect_all_players(void) {
-    if (g_players_ts != 0 && time(NULL) - g_players_ts < 20) return g_players_count;
-    if (pthread_mutex_trylock(&g_collect_lock) != 0) return g_players_count;
-    if (g_players_ts != 0 && time(NULL) - g_players_ts < 20) {
-        pthread_mutex_unlock(&g_collect_lock);
-        return g_players_count;
+/* 零扫描路径: GameState->PlayerArray -> PlayerState -> PawnPrivate 拿角色 (毫秒级)
+ * 返回-1表示PlayerArray不可用, 调用者走全扫描兜底 */
+static int collect_all_players_fast(void) {
+    uintptr_t conn[MAX_PLAYER_CACHE];
+    int np = get_connected_playerstates(conn, MAX_PLAYER_CACHE);
+    if (np <= 0) return -1;
+    g_players_count = 0;
+    for (int i = 0; i < np && g_players_count < MAX_PLAYER_CACHE; i++) {
+        uintptr_t ps = conn[i];
+        PlayerEntry* e = &g_players[g_players_count];
+        memset(e, 0, sizeof(*e));
+        e->playerstate = ps;
+        uintptr_t pcls = 0;
+        if (safe_read_ptr(ps + 0x10, &pcls) != 0 || pcls < 0x10000) continue;
+        /* PawnPrivate -> Character (属性直读, 无扫描) */
+        uintptr_t pp = find_property_in_struct(pcls, "PawnPrivate");
+        if (pp) {
+            int poff = prop_get_offset(pp);
+            uintptr_t ch = 0;
+            if (poff >= 0 && safe_read_ptr(ps + poff, &ch) == 0 && ch > 0x10000) {
+                uintptr_t ov = 0;
+                if (safe_read_ptr(ch, &ov) == 0 && is_plausible_vtable(ov)) {
+                    e->character = ch;
+                    /* Controller (角色属性直读) */
+                    uintptr_t ccls = 0;
+                    if (safe_read_ptr(ch + 0x10, &ccls) == 0 && ccls > 0x10000) {
+                        uintptr_t cprop = find_property_in_struct(ccls, "Controller");
+                        if (cprop) {
+                            int coff = prop_get_offset(cprop);
+                            uintptr_t ctrl = 0;
+                            if (coff >= 0 && safe_read_ptr(ch + coff, &ctrl) == 0 && ctrl > 0x10000) {
+                                uintptr_t cvt = 0;
+                                if (safe_read_ptr(ctrl, &cvt) == 0 && is_plausible_vtable(cvt)) {
+                                    e->controller = ctrl;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        g_players_count++;
     }
+    g_players_ts = time(NULL);
+    palhook_log("collect players (fast): %d", g_players_count);
+    return g_players_count;
+}
+
+/* 全内存扫描兜底 (仅当PlayerArray不可用时; 有线程在扫时其他请求复用旧缓存) */
+static int collect_all_players_scan(void) {
     install_segv_handler();
     g_players_count = 0;
     const char* classes[] = {"BP_Player_Female_C", "BP_Player_Male_C", NULL};
@@ -4772,9 +4814,21 @@ static int collect_all_players(void) {
         }
     }
     g_players_ts = time(NULL);
-    int result = g_players_count;
+    return g_players_count;
+}
+
+/* 入口: TTL内直接返回; 优先零扫描路径, 失败走全扫描; 同一时间只允许一个扫描 */
+static int collect_all_players(void) {
+    if (g_players_ts != 0 && time(NULL) - g_players_ts < 20) return g_players_count;
+    if (pthread_mutex_trylock(&g_collect_lock) != 0) return g_players_count;
+    if (g_players_ts != 0 && time(NULL) - g_players_ts < 20) {
+        pthread_mutex_unlock(&g_collect_lock);
+        return g_players_count;
+    }
+    int r = collect_all_players_fast();
+    if (r < 0) r = collect_all_players_scan();
     pthread_mutex_unlock(&g_collect_lock);
-    return result;
+    return r;
 }
 
 /* 补充玩家详细信息 (名字/UID/等级/经验/坐标) */
@@ -4806,10 +4860,10 @@ static time_t g_acc_ts = 0;
 
 static pthread_mutex_t g_acc_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void collect_player_accounts(void) {
-    /* 平台信息几乎不变: TTL拉到120秒, 且并发时复用已有结果 */
-    if (g_acc_ts != 0 && time(NULL) - g_acc_ts < 120) return;
-    if (pthread_mutex_trylock(&g_acc_lock) != 0) return;
+static int g_acc_refresh_running = 0;
+
+/* 账号扫描核心 (调用者保证单实例执行) */
+static void collect_player_accounts_scan(void) {
     g_acc_count = 0;
     int fi = find_fname_index("PalPlayerAccount");
     if (fi <= 0) { g_acc_ts = time(NULL); return; }
@@ -4853,8 +4907,35 @@ static void collect_player_accounts(void) {
         }
     }
     g_acc_ts = time(NULL);
-    pthread_mutex_unlock(&g_acc_lock);
     palhook_log("collect_player_accounts: %d accounts", g_acc_count);
+}
+
+static void* acc_refresh_thread_fn(void* arg) {
+    (void)arg;
+    collect_player_accounts_scan();
+    g_acc_refresh_running = 0;
+    return NULL;
+}
+
+/* 触发账号收集: 缓存新鲜直接返回; 空缓存时同步扫一次, 否则后台刷新 (请求不阻塞) */
+static void collect_player_accounts(void) {
+    if (g_acc_ts != 0 && time(NULL) - g_acc_ts < 300) return;
+    if (pthread_mutex_trylock(&g_acc_lock) != 0) return;
+    if (g_acc_ts != 0 && time(NULL) - g_acc_ts < 300) {
+        pthread_mutex_unlock(&g_acc_lock);
+        return;
+    }
+    if (g_acc_count == 0) {
+        collect_player_accounts_scan(); /* 首次同步 (缓存为空时必须拿一次) */
+    } else {
+        if (!g_acc_refresh_running) {
+            g_acc_refresh_running = 1;
+            pthread_t t;
+            if (pthread_create(&t, NULL, acc_refresh_thread_fn, NULL) == 0) pthread_detach(t);
+            else g_acc_refresh_running = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_acc_lock);
 }
 
 static void fill_player_details(void) {
@@ -4870,16 +4951,17 @@ static void fill_player_details(void) {
                 int off = prop_get_offset(name_prop);
                 if (off >= 0) read_fstring(ps + off, e->name, sizeof(e->name));
             }
-            /* Ping: APlayerState的复制属性 (float或uint8, 按属性大小读) */
+            /* Ping: UE5.1的APlayerState用CompressedPing(1字节)存储, 实际毫秒=值*4 */
             {
-                uintptr_t ping_prop = find_property_in_struct(pcls, "Ping");
+                uintptr_t ping_prop = find_property_in_struct(pcls, "CompressedPing");
+                if (!ping_prop) ping_prop = find_property_in_struct(pcls, "Ping");
                 if (ping_prop) {
                     int poff = prop_get_offset(ping_prop);
                     int psz = prop_get_size(ping_prop);
                     if (poff >= 0 && (psz == 1 || psz == 4)) {
                         uintptr_t pv = 0;
                         if (safe_read_ptr(ps + poff, &pv) == 0) {
-                            if (psz == 1) e->ping = (float)(pv & 0xFF);
+                            if (psz == 1) e->ping = (float)((pv & 0xFF) * 4); /* CompressedPing*4 */
                             else e->ping = *(float*)&pv;
                         }
                     }
@@ -6187,6 +6269,22 @@ static void* delayed_init_thread(void* arg) {
     /* 重试读取AdminPassword: 此时游戏已加载配置, 内存扫描能找到缓存里的ini原文 */
     if (!g_admin_password[0]) {
         load_admin_password();
+    }
+
+    /* 预热缓存: 后台预扫描公会与账号数据 (面板首次打开时秒回, 不阻塞请求) */
+    if (g_FNamePool) {
+        if (!g_acc_refresh_running) {
+            g_acc_refresh_running = 1;
+            pthread_t ta;
+            if (pthread_create(&ta, NULL, acc_refresh_thread_fn, NULL) == 0) pthread_detach(ta);
+            else g_acc_refresh_running = 0;
+        }
+        if (!g_guilds_refresh_running) {
+            g_guilds_refresh_running = 1;
+            pthread_t tg;
+            if (pthread_create(&tg, NULL, guilds_refresh_thread_fn, NULL) == 0) pthread_detach(tg);
+            else g_guilds_refresh_running = 0;
+        }
     }
     return NULL;
 }
