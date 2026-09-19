@@ -29,7 +29,7 @@
 #include <sys/syscall.h>
 
 #define PALHOOK_PORT 13335
-#define PALHOOK_VERSION "0.9.11"
+#define PALHOOK_VERSION "0.9.12"
 #define MAX_REQUEST 16384
 #define MAX_RESPONSE 262144
 #define LOG_PREFIX "[PalHook] "
@@ -987,6 +987,7 @@ typedef struct {
     char uid[64];
     char ip[64];
     char platform[32];
+    float ping;
     int level;
     int64_t exp;
     double x, y, z;
@@ -4869,6 +4870,21 @@ static void fill_player_details(void) {
                 int off = prop_get_offset(name_prop);
                 if (off >= 0) read_fstring(ps + off, e->name, sizeof(e->name));
             }
+            /* Ping: APlayerState的复制属性 (float或uint8, 按属性大小读) */
+            {
+                uintptr_t ping_prop = find_property_in_struct(pcls, "Ping");
+                if (ping_prop) {
+                    int poff = prop_get_offset(ping_prop);
+                    int psz = prop_get_size(ping_prop);
+                    if (poff >= 0 && (psz == 1 || psz == 4)) {
+                        uintptr_t pv = 0;
+                        if (safe_read_ptr(ps + poff, &pv) == 0) {
+                            if (psz == 1) e->ping = (float)(pv & 0xFF);
+                            else e->ping = *(float*)&pv;
+                        }
+                    }
+                }
+            }
             uintptr_t uid_prop = find_property_in_struct(pcls, "PlayerUId");
             if (uid_prop) {
                 int off = prop_get_offset(uid_prop);
@@ -5008,10 +5024,10 @@ static void api_players(int fd, const char* req) {
         pos += snprintf(buf + pos, 65536 - pos,
             "{\"name\":\"%s\",\"uid\":\"%s\",\"level\":%d,\"exp\":%lld,"
             "\"x\":%.1f,\"y\":%.1f,\"z\":%.1f,"
-            "\"ip\":\"%s\",\"platform\":\"%s\","
+            "\"ip\":\"%s\",\"platform\":\"%s\",\"ping\":%.0f,"
             "\"character\":\"0x%lx\",\"playerstate\":\"0x%lx\"}",
             e->name, e->uid, e->level, (long long)e->exp,
-            e->x, e->y, e->z, e->ip, e->platform, e->character, e->playerstate);
+            e->x, e->y, e->z, e->ip, e->platform, e->ping, e->character, e->playerstate);
     }
     pos += snprintf(buf + pos, 65536 - pos, "],\"count\":%d}", g_players_count);
     json_ok(fd, buf);
@@ -5564,27 +5580,36 @@ static void json_escape_str(const char* src, char* dst, int dst_size) {
 /* 扫描具体公会类实例: 类链含PalGroupGuildBase + ID非零 (排除UClass对象/CDO) */
 static int collect_guild_objects(uintptr_t* out, int max_n) {
     const char* names[] = {"PalGroupGuild", "PalGroupIndependentGuild", "PalGroupGuildBase", NULL};
+    int fname_idx[3];
+    int nf = 0;
+    for (int c = 0; names[c]; c++) {
+        int fi = find_fname_index(names[c]);
+        if (fi > 0) fname_idx[nf++] = fi;
+    }
+    if (nf == 0) return 0;
     int n = 0;
     uintptr_t segs[MAX_RW_REGIONS][2];
     int seg_count = snapshot_rw(segs, MAX_RW_REGIONS);
-    for (int c = 0; names[c] && n < max_n; c++) {
-        int fi = find_fname_index(names[c]);
-        if (fi <= 0) continue;
-        for (int seg = 0; seg < seg_count && n < max_n; seg++) {
-            uintptr_t* ptr = (uintptr_t*)segs[seg][0];
-            size_t cnt = (segs[seg][1] - segs[seg][0]) / sizeof(uintptr_t);
-            for (size_t i = 0; i < cnt && n < max_n; i++) {
-                uintptr_t val = ptr[i];
-                if (val < 0x10000 || val > 0x800000000000UL) continue;
-                uintptr_t ov = 0;
-                if (safe_read_ptr(val, &ov) != 0 || !is_plausible_vtable(ov)) continue;
-                uintptr_t uc = 0;
-                if (safe_read_ptr(val + 0x10, &uc) != 0) continue;
-                uintptr_t ucv = 0;
-                if (safe_read_ptr(uc, &ucv) != 0 || !is_uclass_vtable(ucv)) continue;
-                uintptr_t fn = 0;
-                if (safe_read_ptr(uc + 0x18, &fn) != 0) continue;
-                if ((int)(fn & 0xFFFFFFFF) != fi) continue;
+    for (int seg = 0; seg < seg_count && n < max_n; seg++) {
+        uintptr_t* ptr = (uintptr_t*)segs[seg][0];
+        size_t cnt = (segs[seg][1] - segs[seg][0]) / sizeof(uintptr_t);
+        for (size_t i = 0; i < cnt && n < max_n; i++) {
+            uintptr_t val = ptr[i];
+            if (val < 0x10000 || val > 0x800000000000UL) continue;
+            uintptr_t ov = 0;
+            if (safe_read_ptr(val, &ov) != 0 || !is_plausible_vtable(ov)) continue;
+            uintptr_t uc = 0;
+            if (safe_read_ptr(val + 0x10, &uc) != 0) continue;
+            uintptr_t ucv = 0;
+            if (safe_read_ptr(uc, &ucv) != 0 || !is_uclass_vtable(ucv)) continue;
+            uintptr_t fn = 0;
+            if (safe_read_ptr(uc + 0x18, &fn) != 0) continue;
+            {
+                int fnm = (int)(fn & 0xFFFFFFFF);
+                int is_cls = 0;
+                for (int c = 0; c < nf; c++) if (fnm == fname_idx[c]) { is_cls = 1; break; }
+                if (!is_cls) continue;
+            }
                 /* 排除UClass对象自身: 类链必须含PalGroupGuildBase */
                 if (!class_chain_contains(val, "PalGroupGuildBase")) continue;
                 /* 排除CDO: ID FGuid必须非零 */
@@ -5597,7 +5622,6 @@ static int collect_guild_objects(uintptr_t* out, int max_n) {
                 if (!dup) out[n++] = val;
             }
         }
-    }
     return n;
 }
 
@@ -5607,45 +5631,26 @@ static int g_guilds_cache_len = 0;
 static time_t g_guilds_cache_ts = 0;
 static pthread_mutex_t g_guilds_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void api_guilds(int fd, const char* req) {
-    (void)req;
-    if (g_FNamePool == 0 || !g_hook_active) { json_err(fd, 503, "not ready"); return; }
+static pthread_mutex_t g_guilds_scan_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_guilds_refresh_running = 0;
 
-    /* 缓存命中: 直接返回 */
-    pthread_mutex_lock(&g_guilds_cache_lock);
-    int cache_hit = (g_guilds_cache_len > 0 && time(NULL) - g_guilds_cache_ts < 8);
-    if (cache_hit) {
-        char tmp[131072];
-        memcpy(tmp, g_guilds_cache, g_guilds_cache_len + 1);
-        pthread_mutex_unlock(&g_guilds_cache_lock);
-        palhook_log("guilds: cache hit (%d bytes)", g_guilds_cache_len);
-        json_ok(fd, tmp);
+/* 后台刷新: 单趟扫描全部公会类 -> 序列化 -> 写入缓存 (请求永不等待扫描) */
+static void refresh_guilds_cache(void) {
+    if (g_FNamePool == 0 || !g_hook_active) return;
+    if (pthread_mutex_trylock(&g_guilds_scan_lock) != 0) return;
+    if (g_guilds_cache_len > 0 && time(NULL) - g_guilds_cache_ts < 60) {
+        pthread_mutex_unlock(&g_guilds_scan_lock);
         return;
     }
-    pthread_mutex_unlock(&g_guilds_cache_lock);
 
     static uintptr_t guilds[64];
     int guild_n = 0;
     /* 主路径: 按具体类名扫描实例 */
     guild_n = collect_guild_objects(guilds, 64);
     palhook_log("guilds: scan -> %d guild objects", guild_n);
-    /* 副路径: PalGroupManager.GuildMap TMap值 (若找到活实例) */
-    uintptr_t gm = get_group_manager();
-    if (gm && tmap_looks_live(gm + 0xf8)) {
-        uintptr_t mapvals[64];
-        int stride = 0;
-        int mn = tmap_enum_guid_values(gm + 0xf8, is_guild_object, mapvals, 64, &stride);
-        for (int k = 0; k < mn && guild_n < 64; k++) {
-            int dup = 0;
-            for (int s = 0; s < guild_n; s++) if (guilds[s] == mapvals[k]) { dup = 1; break; }
-            if (!dup) guilds[guild_n++] = mapvals[k];
-        }
-        palhook_log("guilds: GuildMap -> %d more (stride=%d)", mn, stride);
-    }
-
 
     char* buf = (char*)malloc(131072);
-    if (!buf) { json_err(fd, 500, "malloc failed"); return; }
+    if (!buf) return;
     int pos = snprintf(buf, 131072, "{\"guilds\":[");
     int out_n = 0;
     static const char* role_names[] = {"None", "GuildMaster", "SubMaster", "Member", "Guest"};
@@ -5854,9 +5859,8 @@ static void api_guilds(int fd, const char* req) {
             gid, gname, level, bc_count, admin_uid, member_count, members_json);
         out_n++;
     }
-    pos += snprintf(buf + pos, 131072 - pos, "],\"count\":%d,\"source\":\"scan+map\"}", out_n);
-    json_ok(fd, buf);
-    /* 写入缓存 */
+    pos += snprintf(buf + pos, 131072 - pos, "],\"count\":%d,\"source\":\"scan\"}", out_n);
+    /* 写入缓存 (短暂加锁) */
     pthread_mutex_lock(&g_guilds_cache_lock);
     if (pos < 131072) {
         memcpy(g_guilds_cache, buf, pos + 1);
@@ -5864,7 +5868,35 @@ static void api_guilds(int fd, const char* req) {
         g_guilds_cache_ts = time(NULL);
     }
     pthread_mutex_unlock(&g_guilds_cache_lock);
+    pthread_mutex_unlock(&g_guilds_scan_lock);
     free(buf);
+}
+
+static void* guilds_refresh_thread_fn(void* arg) {
+    (void)arg;
+    refresh_guilds_cache();
+    g_guilds_refresh_running = 0;
+    return NULL;
+}
+
+/* GET /guilds — 返回缓存 (首次同步刷新, 之后60秒TTL+后台刷新, 永不阻塞) */
+static void api_guilds(int fd, const char* req) {
+    (void)req;
+    if (g_FNamePool == 0 || !g_hook_active) { json_err(fd, 503, "not ready"); return; }
+    if (g_guilds_cache_len == 0) refresh_guilds_cache();
+    if (g_guilds_cache_len > 0 && time(NULL) - g_guilds_cache_ts >= 60 && !g_guilds_refresh_running) {
+        g_guilds_refresh_running = 1;
+        pthread_t t;
+        if (pthread_create(&t, NULL, guilds_refresh_thread_fn, NULL) == 0) pthread_detach(t);
+        else g_guilds_refresh_running = 0;
+    }
+    char tmp[131072];
+    pthread_mutex_lock(&g_guilds_cache_lock);
+    int len = g_guilds_cache_len;
+    if (len > 0) memcpy(tmp, g_guilds_cache, len + 1);
+    pthread_mutex_unlock(&g_guilds_cache_lock);
+    if (len <= 0) { json_err(fd, 500, "guilds cache not ready"); return; }
+    json_ok(fd, tmp);
 }
 
 

@@ -462,7 +462,7 @@ async function fetchOnline() {
         userId: '',
         iP: p.ip ?? '',
         platform: p.platform ?? '',
-        ping: 0,
+        ping: p.ping ?? 0,
         location_x: p.x,
         location_y: p.y,
         location_z: p.z,

@@ -218,7 +218,7 @@ let timer: ReturnType<typeof setInterval> | null = null
 
 onMounted(() => {
   fetchGuilds()
-  timer = setInterval(fetchGuilds, 30000)
+  timer = setInterval(fetchGuilds, 120000)
 })
 
 onUnmounted(() => {
