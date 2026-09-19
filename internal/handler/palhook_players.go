@@ -34,6 +34,8 @@ type hookPlayer struct {
 	X           float64 `json:"x"`
 	Y           float64 `json:"y"`
 	Z           float64 `json:"z"`
+	IP          string  `json:"ip"`
+	Platform    string  `json:"platform"`
 	Character   string  `json:"character"`
 	Playerstate string  `json:"playerstate"`
 }
@@ -93,6 +95,7 @@ type onlinePlayerOut struct {
 	PlayerID    string  `json:"playerId"`
 	UserID      string  `json:"userId"`
 	IP          string  `json:"iP"`
+	Platform    string  `json:"platform"`
 	Ping        float64 `json:"ping"`
 	LocationX   float64 `json:"location_x"`
 	LocationY   float64 `json:"location_y"`
@@ -131,6 +134,7 @@ func (h *PalHookPlayersHandler) GetOnlinePlayers(c *gin.Context) {
 	for _, p := range players {
 		out = append(out, onlinePlayerOut{
 			Name: p.Name, AccountName: p.Name, PlayerID: p.Uid, UserID: p.Uid,
+			IP: p.IP, Platform: p.Platform,
 			Ping: 0, LocationX: p.X, LocationY: p.Y, LocationZ: p.Z, Level: p.Level,
 		})
 	}

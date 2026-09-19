@@ -29,7 +29,7 @@
 #include <sys/syscall.h>
 
 #define PALHOOK_PORT 13335
-#define PALHOOK_VERSION "0.9.7"
+#define PALHOOK_VERSION "0.9.8"
 #define MAX_REQUEST 16384
 #define MAX_RESPONSE 262144
 #define LOG_PREFIX "[PalHook] "
@@ -982,8 +982,11 @@ static uintptr_t find_property_in_struct(uintptr_t ustruct, const char* prop_nam
 typedef struct {
     uintptr_t character;
     uintptr_t playerstate;
+    uintptr_t controller;
     char name[64];
     char uid[64];
+    char ip[64];
+    char platform[32];
     int level;
     int64_t exp;
     double x, y, z;
@@ -4680,13 +4683,43 @@ static int collect_all_players(void) {
                 /* 关键过滤2: 必须有活的PlayerController才是在线玩家
                  * (玩家下线后角色残留在内存里直到GC, 但Controller会被解除/销毁,
                  *  否则空服也会显示有玩家) */
+                uintptr_t ctrl = 0;
                 {
                     uintptr_t cprop = find_property_in_struct(uc, "Controller");
                     if (cprop) {
                         int coff = prop_get_offset(cprop);
-                        uintptr_t ctrl = 0;
                         if (coff < 0 ||
-                            safe_read_ptr(val + coff, &ctrl) != 0 || ctrl < 0x10000) continue;
+                            safe_read_ptr(val + coff, &ctrl) != 0 || ctrl < 0x10000) ctrl = 0;
+                    }
+                    /* 兜底: PlayerState::GetOwningController() (引擎函数) */
+                    if (!ctrl) {
+                        uintptr_t psp = get_pawn_playerstate(val);
+                        if (psp > 0x10000) {
+                            uintptr_t pcls = 0;
+                            if (safe_read_ptr(psp + 0x10, &pcls) == 0 && pcls > 0x10000) {
+                                void* uf2 = find_ufunction_in_class(pcls, "GetOwningController");
+                                if (uf2) {
+                                    uintptr_t pr2 = 0;
+                                    safe_read_ptr((uintptr_t)uf2 + UFUNC_OFFSET_PARMSSIZE, &pr2);
+                                    int psz2 = (int)(pr2 & 0xFFFFFFFF);
+                                    if (psz2 > 0 && psz2 <= 64) {
+                                        uint8_t* p2 = (uint8_t*)calloc(1, (size_t)psz2);
+                                        int waited2 = 0;
+                                        if (call_and_wait((void*)psp, uf2, p2, 5000, &waited2) == 0) {
+                                            uintptr_t rv2 = find_property_in_struct((uintptr_t)uf2, "ReturnValue");
+                                            int ro2 = rv2 ? prop_get_offset(rv2) : 0;
+                                            if (ro2 >= 0 && ro2 + 8 <= psz2) {
+                                                memcpy(&ctrl, p2 + ro2, 8);
+                                            }
+                                        }
+                                        free(p2);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (ctrl < 0x10000) continue;
+                    {
                         uintptr_t cvt = 0;
                         if (safe_read_ptr(ctrl, &cvt) != 0 || !is_plausible_vtable(cvt)) continue;
                         uintptr_t ccls = 0;
@@ -4695,6 +4728,7 @@ static int collect_all_players(void) {
                         if (safe_read_ptr(ccls, &ccv) != 0 || !is_uclass_vtable(ccv)) continue;
                     }
                 }
+                /* 注意: 上面的块结束后 ctrl 仍有效, memset之后统一写入数组 */
                 /* 去重 */
                 int dup = 0;
                 for (int d = 0; d < g_players_count; d++) {
@@ -4704,6 +4738,7 @@ static int collect_all_players(void) {
                 memset(&g_players[g_players_count], 0, sizeof(PlayerEntry));
                 g_players[g_players_count].character = val;
                 g_players[g_players_count].playerstate = get_pawn_playerstate(val);
+                g_players[g_players_count].controller = ctrl;
                 g_players_count++;
             }
         }
@@ -4713,6 +4748,87 @@ static int collect_all_players(void) {
 }
 
 /* 补充玩家详细信息 (名字/UID/等级/经验/坐标) */
+/* 在base的[start, max_off)内尝试匹配UTF-16LE的 d.d.d.d 字符串 */
+static int match_ipv4_wide(uint8_t* base, int start, int max_off, char* out, int out_size) {
+    int tl = 0, dots = 0;
+    for (int k = 0; k < 20 && tl < out_size - 2; k++) {
+        int idx = start + k * 2;
+        if (idx + 1 >= max_off) return 0;
+        uint8_t b0 = base[idx];
+        uint8_t b1 = base[idx + 1];
+        if (b0 >= '0' && b0 <= '9' && b1 == 0) { out[tl++] = (char)b0; }
+        else if (b0 == '.' && b1 == 0 && dots < 3) { out[tl++] = '.'; dots++; }
+        else if ((b0 == ':' || b0 == 0) && b1 == 0) break;
+        else return 0;
+    }
+    out[tl] = 0;
+    return (dots == 3 && tl >= 7);
+}
+
+/* 从自建params缓冲读FString (缓冲是malloc的, 不做region检查) */
+static void fstring_from_local_buf(uint8_t* addr, char* out, int out_size) {
+    uintptr_t data = 0, num_raw = 0;
+    memcpy(&data, addr, 8);
+    memcpy(&num_raw, addr + 8, 8);
+    int num = (int)(num_raw & 0xFFFFFFFF);
+    if (!data || data < 0x10000 || num <= 0 || num > 4096) return;
+    utf16_to_utf8((const uint16_t*)data, num, out, out_size);
+}
+
+/* UPalPlayerAccount缓存: uid -> 平台名 */
+static char g_acc_uid[MAX_PLAYER_CACHE][64];
+static char g_acc_platform[MAX_PLAYER_CACHE][32];
+static int g_acc_count = 0;
+static time_t g_acc_ts = 0;
+
+static void collect_player_accounts(void) {
+    if (g_acc_ts != 0 && time(NULL) - g_acc_ts < 20) return;
+    g_acc_count = 0;
+    int fi = find_fname_index("PalPlayerAccount");
+    if (fi <= 0) { g_acc_ts = time(NULL); return; }
+    uintptr_t segs[MAX_RW_REGIONS][2];
+    int seg_count = snapshot_rw(segs, MAX_RW_REGIONS);
+    for (int seg = 0; seg < seg_count && g_acc_count < MAX_PLAYER_CACHE; seg++) {
+        uintptr_t* ptr = (uintptr_t*)segs[seg][0];
+        size_t cnt = (segs[seg][1] - segs[seg][0]) / sizeof(uintptr_t);
+        for (size_t i = 0; i < cnt && g_acc_count < MAX_PLAYER_CACHE; i++) {
+            uintptr_t val = ptr[i];
+            if (val < 0x10000 || val > 0x800000000000UL) continue;
+            uintptr_t ov = 0;
+            if (safe_read_ptr(val, &ov) != 0 || !is_plausible_vtable(ov)) continue;
+            uintptr_t uc2 = 0;
+            if (safe_read_ptr(val + 0x10, &uc2) != 0 || uc2 < 0x10000) continue;
+            uintptr_t ucv = 0;
+            if (safe_read_ptr(uc2, &ucv) != 0 || !is_uclass_vtable(ucv)) continue;
+            uintptr_t fn = 0;
+            if (safe_read_ptr(uc2 + 0x18, &fn) != 0) continue;
+            if ((int)(fn & 0xFFFFFFFF) != fi) continue;
+            uintptr_t up = find_property_in_struct(uc2, "PlayerUId");
+            uintptr_t pp = find_property_in_struct(uc2, "PlayerPlatform");
+            if (!up || !pp) continue;
+            int uoff = prop_get_offset(up);
+            int poff = prop_get_offset(pp);
+            if (uoff < 0 || poff < 0) continue;
+            char uid[64] = "";
+            format_guid(val + uoff, uid);
+            if (uid[0] == '0' && uid[1] == '0') continue; /* 全零GUID跳过 */
+            uintptr_t pv = 0;
+            safe_read_ptr(val + poff, &pv);
+            int plat = (int)(pv & 0xFF);
+            const char* pname = "Unknown";
+            if (plat == 1) pname = "Steam";
+            else if (plat == 2) pname = "Xbox";
+            else if (plat == 3) pname = "Mac";
+            else if (plat == 4) pname = "PS5";
+            snprintf(g_acc_uid[g_acc_count], 64, "%s", uid);
+            snprintf(g_acc_platform[g_acc_count], 32, "%s", pname);
+            g_acc_count++;
+        }
+    }
+    g_acc_ts = time(NULL);
+    palhook_log("collect_player_accounts: %d accounts", g_acc_count);
+}
+
 static void fill_player_details(void) {
     install_segv_handler();
     for (int i = 0; i < g_players_count; i++) {
@@ -4740,6 +4856,147 @@ static void fill_player_details(void) {
                 }
             }
         }
+        /* 兜底: 若collect没拿到controller, 这里再通过PlayerState::GetOwningController取一次 */
+        if (!e->controller && e->playerstate > 0x10000) {
+            uintptr_t pcls = 0;
+            if (safe_read_ptr(e->playerstate + 0x10, &pcls) == 0 && pcls > 0x10000) {
+                void* uf2 = find_ufunction_in_class(pcls, "GetOwningController");
+                if (uf2) {
+                    uintptr_t pr2 = 0;
+                    safe_read_ptr((uintptr_t)uf2 + UFUNC_OFFSET_PARMSSIZE, &pr2);
+                    int psz2 = (int)(pr2 & 0xFFFFFFFF);
+                    if (psz2 > 0 && psz2 <= 64) {
+                        uint8_t* p2 = (uint8_t*)calloc(1, (size_t)psz2);
+                        int waited2 = 0;
+                        if (call_and_wait((void*)e->playerstate, uf2, p2, 5000, &waited2) == 0) {
+                            uintptr_t rv2 = find_property_in_struct((uintptr_t)uf2, "ReturnValue");
+                            int ro2 = rv2 ? prop_get_offset(rv2) : 0;
+                            if (ro2 >= 0 && ro2 + 8 <= psz2) {
+                                memcpy(&e->controller, p2 + ro2, 8);
+                            }
+                        }
+                        free(p2);
+                    }
+                }
+            }
+        }
+
+        /* IP: 调 PlayerController::GetPlayerNetworkAddress (返回 "ip:port" FString) */
+        if (e->controller && !e->ip[0]) {
+            uintptr_t ccls = 0;
+            if (safe_read_ptr(e->controller + 0x10, &ccls) == 0 && ccls > 0x10000) {
+                void* uf = find_ufunction_in_class(ccls, "GetPlayerNetworkAddress");
+                /* 兜底: NetConnection 对象内存 + 跟随对象内指针 找 x.x.x.x (URL Host是独立FString缓冲) */
+                if (!uf) {
+                    uintptr_t ncp = find_property_in_struct(ccls, "NetConnection");
+                    if (!ncp) {
+                    }
+                    if (ncp) {
+                        int nco = prop_get_offset(ncp);
+                        uintptr_t nc = 0;
+                        safe_read_ptr(e->controller + nco, &nc);
+                        if (nco >= 0 && nc > 0x10000 && region_contains(nc)) {
+                            int found = 0;
+                            /* 1. 对象本体前2KB直接找 (先验证整段在区域内!) */
+                            int can_inline = region_contains(nc) && region_contains(nc + 2047 + 40);
+                            if (can_inline) {
+                                /* 1a. 宽字符模式 (UTF-16LE, UE字符串) */
+                                for (int boff = 0; boff < 2040 && !found; boff += 2) {
+                                    char tmp[64] = {0};
+                                    if (match_ipv4_wide((uint8_t*)nc, boff, 2080, tmp, sizeof(tmp))) {
+                                        snprintf(e->ip, sizeof(e->ip), "%s", tmp);
+                                        found = 1;
+                                    }
+                                }
+                            }
+                            for (int boff = 0; boff < 2048 && !found && can_inline; boff++) {
+                                uint8_t b0 = *(uint8_t*)(nc + boff);
+                                if (!(b0 >= '0' && b0 <= '9')) continue;
+                                char tmp[64] = {0};
+                                int tl = 0, dots = 0, ok = 1;
+                                for (int k = 0; k < 40 && tl < 60; k++) {
+                                    uint8_t bc = *(uint8_t*)(nc + boff + k);
+                                    if (bc >= '0' && bc <= '9') { tmp[tl++] = (char)bc; }
+                                    else if (bc == '.' && dots < 3) { tmp[tl++] = '.'; dots++; }
+                                    else if (bc == ':' || bc == 0 || bc < 0x20) { break; }
+                                    else { ok = 0; break; }
+                                }
+                                if (ok && dots == 3 && tl >= 7) {
+                                    snprintf(e->ip, sizeof(e->ip), "%s", tmp);
+                                    found = 1;
+                                }
+                            }
+                            /* 2. 跟随对象内指针, 在指针指向处找 */
+                            for (int poff = 0; poff < 512 && !found; poff += 8) {
+                                uintptr_t cand = 0;
+                                memcpy(&cand, (void*)(nc + poff), 8);
+                                if (cand < 0x10000 || cand > 0x800000000000UL) continue;
+                                if (!region_contains(cand) || !region_contains(cand + 63 + 40)) continue;
+                                /* 宽字符模式 */
+                                for (int boff = 0; boff < 60 && !found; boff += 2) {
+                                    char tmp[64] = {0};
+                                    if (match_ipv4_wide((uint8_t*)cand, boff, 96, tmp, sizeof(tmp))) {
+                                        snprintf(e->ip, sizeof(e->ip), "%s", tmp);
+                                        found = 1;
+                                    }
+                                }
+                                for (int boff = 0; boff < 64 && !found; boff++) {
+                                    uint8_t b0 = *(uint8_t*)(cand + boff);
+                                    if (!(b0 >= '0' && b0 <= '9')) continue;
+                                    char tmp[64] = {0};
+                                    int tl = 0, dots = 0, ok = 1;
+                                    for (int k = 0; k < 40 && tl < 60; k++) {
+                                        uint8_t bc = *(uint8_t*)(cand + boff + k);
+                                        if (bc >= '0' && bc <= '9') { tmp[tl++] = (char)bc; }
+                                        else if (bc == '.' && dots < 3) { tmp[tl++] = '.'; dots++; }
+                                        else if (bc == ':' || bc == 0 || bc < 0x20) { break; }
+                                        else { ok = 0; break; }
+                                    }
+                                    if (ok && dots == 3 && tl >= 7) {
+                                        snprintf(e->ip, sizeof(e->ip), "%s", tmp);
+                                        found = 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (uf) {
+                    uintptr_t pr = 0;
+                    safe_read_ptr((uintptr_t)uf + UFUNC_OFFSET_PARMSSIZE, &pr);
+                    int psz = (int)(pr & 0xFFFFFFFF);
+                    if (psz > 0 && psz <= 64) {
+                        uint8_t* params = (uint8_t*)calloc(1, (size_t)psz);
+                        int waited = 0;
+                        int r = call_and_wait((void*)e->controller, uf, params, 10000, &waited);
+                        if (r == 0) {
+                            uintptr_t rvp = find_property_in_struct((uintptr_t)uf, "ReturnValue");
+                            int rv_off = rvp ? prop_get_offset(rvp) : 0;
+                            if (rv_off >= 0 && rv_off + 16 <= psz) {
+                                char addr_str[128] = {0};
+                                fstring_from_local_buf(params + rv_off, addr_str, sizeof(addr_str));
+                                char* colon = strchr(addr_str, ':');
+                                if (colon) *colon = 0;
+                                if (addr_str[0]) snprintf(e->ip, sizeof(e->ip), "%s", addr_str);
+                            }
+                        }
+                        free(params);
+                    }
+                }
+            }
+        }
+
+        /* 平台: 从 UPalPlayerAccount 按UID匹配 (Steam/Xbox/Mac/PS5) */
+        if (e->uid[0] && !e->platform[0]) {
+            collect_player_accounts();
+            for (int a = 0; a < g_acc_count; a++) {
+                if (strcmp(g_acc_uid[a], e->uid) == 0) {
+                    snprintf(e->platform, sizeof(e->platform), "%s", g_acc_platform[a]);
+                    break;
+                }
+            }
+        }
+
         uintptr_t ip = get_player_individual(e->character);
         if (ip) {
             uintptr_t lv = 0, ex = 0;
@@ -4777,9 +5034,10 @@ static void api_players(int fd, const char* req) {
         pos += snprintf(buf + pos, 65536 - pos,
             "{\"name\":\"%s\",\"uid\":\"%s\",\"level\":%d,\"exp\":%lld,"
             "\"x\":%.1f,\"y\":%.1f,\"z\":%.1f,"
+            "\"ip\":\"%s\",\"platform\":\"%s\","
             "\"character\":\"0x%lx\",\"playerstate\":\"0x%lx\"}",
             e->name, e->uid, e->level, (long long)e->exp,
-            e->x, e->y, e->z, e->character, e->playerstate);
+            e->x, e->y, e->z, e->ip, e->platform, e->character, e->playerstate);
     }
     pos += snprintf(buf + pos, 65536 - pos, "],\"count\":%d}", g_players_count);
     json_ok(fd, buf);
