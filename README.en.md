@@ -22,7 +22,7 @@ Browser ──> palmanager (8080) ──HTTP/BasicAuth──> palhook (13335) �
 
 **Hook-only architecture**: the panel talks only to PalHook — no official REST API, RCON or Bridge. Player list / metrics / announce / chat / kick / ban / give-item / spawn-pal / exp / level / teleport / tech points / money / guilds are all done in-process by PalHook.
 
-## Features (PalHook v0.9.5)
+## Features (PalHook v0.9.7)
 
 | Feature | Description |
 |------|------|
