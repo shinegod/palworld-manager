@@ -81,9 +81,13 @@ func (h *HookDashboardHandler) GetInfo(c *gin.Context) {
 	}
 	var health map[string]any
 	_ = json.Unmarshal(body, &health)
+	servername, _ := health["server_name"].(string)
+	if servername == "" {
+		servername = "未知服务器"
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"version":     health["version"],
-		"servername":  "PalHook-Dev",
+		"servername":  servername,
 		"description": "hook-only",
 		"pid":         health["pid"],
 	})

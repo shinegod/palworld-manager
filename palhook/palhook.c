@@ -29,7 +29,7 @@
 #include <sys/syscall.h>
 
 #define PALHOOK_PORT 13335
-#define PALHOOK_VERSION "0.9.5"
+#define PALHOOK_VERSION "0.9.7"
 #define MAX_REQUEST 16384
 #define MAX_RESPONSE 262144
 #define LOG_PREFIX "[PalHook] "
@@ -67,6 +67,8 @@ static void*  g_ConsoleManager = NULL;
 
 /* 认证密码 (从PalWorldSettings.ini读取AdminPassword) */
 static char g_admin_password[128] = {0};
+/* 服务器名 (从同一配置读取ServerName, 面板展示用) */
+static char g_server_name[256] = {0};
 
 /* 测试VPS加载基址 (所有硬编码地址以它为基准换算成偏移, 生产环境ASLR安全) */
 #define VPS_BASE_ADDR 0x200000
@@ -205,6 +207,20 @@ static int read_ini_password(const char* path) {
     if (!f) return 0;
     char line[8192];
     while (fgets(line, sizeof(line), f)) {
+        /* ServerName: 与AdminPassword同一行, 且在它前面 */
+        if (!g_server_name[0]) {
+            char* sn = strstr(line, "ServerName=\"");
+            if (sn) {
+                sn += 12;
+                char* end = strchr(sn, '"');
+                if (end && (end - sn) < 255 && end > sn) {
+                    int rl = (int)(end - sn);
+                    memcpy(g_server_name, sn, (size_t)rl);
+                    g_server_name[rl] = '\0';
+                    palhook_log("loaded ServerName from %s (%d chars)", path, (int)strlen(g_server_name));
+                }
+            }
+        }
         char* ap = strstr(line, "AdminPassword=\"");
         if (!ap) continue;
         ap += 15;
@@ -261,62 +277,105 @@ static void finalize_password_value(const char* raw, int raw_len) {
     palhook_log("loaded AdminPassword from memory (%d chars)", raw_len);
 }
 
-/* 内存扫描GConfig缓存里的ini原文 (游戏启动后配置原文常驻内存, 无需知道文件路径) */
+/* 内存扫描GConfig缓存里的ini原文 (游戏启动后配置原文常驻内存, 无需知道文件路径)
+ * 同时提取AdminPassword与ServerName */
+static int utf16_to_utf8(const uint16_t* in, int in_len, char* out, int out_size);
+
 static int scan_memory_for_admin_password(void) {
     if (g_all_rw_count <= 0) return 0;
     static const char pat_narrow[] = "AdminPassword=\"";
+    static const char pat_narrow_sn[] = "ServerName=\"";
     static const uint8_t pat_wide[] = {
         'A',0,'d',0,'m',0,'i',0,'n',0,'P',0,'a',0,'s',0,'s',0,
         'w',0,'o',0,'r',0,'d',0,'=',0,'"',0
+    };
+    static const uint8_t pat_wide_sn[] = {
+        'S',0,'e',0,'r',0,'v',0,'e',0,'r',0,'N',0,'a',0,'m',0,'e',0,'=',0,'"',0
     };
     uintptr_t segs[MAX_RW_REGIONS][2];
     int seg_count = snapshot_rw(segs, MAX_RW_REGIONS);
 
     /* 第一遍: 宽字符模式 (UE FConfigFile原文是UTF-16 FString, 值未编码) */
-    for (int seg = 0; seg < seg_count && !g_admin_password[0]; seg++) {
+    for (int seg = 0; seg < seg_count; seg++) {
         uint8_t* base = (uint8_t*)segs[seg][0];
         size_t size = segs[seg][1] - segs[seg][0];
         if (size < 64) continue;
-        uint8_t* wf = (uint8_t*)memmem(base, size, pat_wide, sizeof(pat_wide));
-        if (wf) {
-            uint8_t* p = wf + sizeof(pat_wide);
-            char out[128]; int o = 0;
-            while (o < 127 && (uintptr_t)(p + 1) < segs[seg][1]) {
-                uint16_t ch = (uint16_t)(p[0] | (p[1] << 8));
-                if (ch == '"' || ch == 0) break;
-                if (ch >= 0x80) break;
-                out[o++] = (char)ch;
-                p += 2;
+        /* ServerName (支持中文: UTF-16转UTF-8) */
+        if (!g_server_name[0]) {
+            uint8_t* sf = (uint8_t*)memmem(base, size, pat_wide_sn, sizeof(pat_wide_sn));
+            if (sf) {
+                uint8_t* p = sf + sizeof(pat_wide_sn);
+                uint16_t ubuf[128];
+                int un = 0;
+                while (un < 127 && (uintptr_t)(p + 1) < segs[seg][1]) {
+                    uint16_t ch = (uint16_t)(p[0] | (p[1] << 8));
+                    if (ch == '"' || ch == 0) break;
+                    ubuf[un++] = ch;
+                    p += 2;
+                }
+                if (un > 0 && utf16_to_utf8(ubuf, un, g_server_name, sizeof(g_server_name)) > 0) {
+                    palhook_log("loaded ServerName from memory wide (%s)", g_server_name);
+                }
             }
-            out[o] = 0;
-            if (o > 0) {
-                finalize_password_value(out, o);
-                if (g_admin_password[0]) return 1;
+        }
+        /* AdminPassword */
+        if (!g_admin_password[0]) {
+            uint8_t* wf = (uint8_t*)memmem(base, size, pat_wide, sizeof(pat_wide));
+            if (wf) {
+                uint8_t* p = wf + sizeof(pat_wide);
+                char out[128]; int o = 0;
+                while (o < 127 && (uintptr_t)(p + 1) < segs[seg][1]) {
+                    uint16_t ch = (uint16_t)(p[0] | (p[1] << 8));
+                    if (ch == '"' || ch == 0) break;
+                    if (ch >= 0x80) break;
+                    out[o++] = (char)ch;
+                    p += 2;
+                }
+                out[o] = 0;
+                if (o > 0) {
+                    finalize_password_value(out, o);
+                }
             }
         }
     }
 
     /* 第二遍: 窄字节模式 (某些缓存放未编码ASCII) */
-    for (int seg = 0; seg < seg_count && !g_admin_password[0]; seg++) {
+    for (int seg = 0; seg < seg_count; seg++) {
         uint8_t* base = (uint8_t*)segs[seg][0];
         size_t size = segs[seg][1] - segs[seg][0];
         if (size < 64) continue;
-        uint8_t* found = (uint8_t*)memmem(base, size, pat_narrow, sizeof(pat_narrow) - 1);
-        if (found) {
-            uint8_t* p = found + sizeof(pat_narrow) - 1;
-            char out[128]; int o = 0;
-            while (o < 127 && (uintptr_t)p < segs[seg][1] && *p != '"' && *p != 0) {
-                out[o++] = (char)*p++;
+        /* ServerName */
+        if (!g_server_name[0]) {
+            uint8_t* sf = (uint8_t*)memmem(base, size, pat_narrow_sn, sizeof(pat_narrow_sn) - 1);
+            if (sf) {
+                uint8_t* p = sf + sizeof(pat_narrow_sn) - 1;
+                int o = 0;
+                while (o < 255 && (uintptr_t)p < segs[seg][1] && *p != '"' && *p != 0) {
+                    g_server_name[o++] = (char)*p++;
+                }
+                g_server_name[o] = 0;
+                if (o > 0) palhook_log("loaded ServerName from memory narrow (%s)", g_server_name);
             }
-            out[o] = 0;
-            if (o > 0) {
-                finalize_password_value(out, o);
-                if (g_admin_password[0]) return 1;
+        }
+        /* AdminPassword */
+        if (!g_admin_password[0]) {
+            uint8_t* found = (uint8_t*)memmem(base, size, pat_narrow, sizeof(pat_narrow) - 1);
+            if (found) {
+                uint8_t* p = found + sizeof(pat_narrow) - 1;
+                char out[128]; int o = 0;
+                while (o < 127 && (uintptr_t)p < segs[seg][1] && *p != '"' && *p != 0) {
+                    out[o++] = (char)*p++;
+                }
+                out[o] = 0;
+                if (o > 0) {
+                    finalize_password_value(out, o);
+                }
             }
         }
     }
-    return 0;
+    return g_admin_password[0] ? 1 : 0;
 }
+
 
 /* 自动寻找PalWorldSettings.ini并读取AdminPassword
  * 顺序: 环境变量 -> 工作目录/常见路径 -> find搜索 -> 内存扫描 */
@@ -727,14 +786,16 @@ static int read_body(int fd, const char* req, char* body, size_t bsize) {
 /* ========== API Handlers ========== */
 
 static void api_health(int fd) {
-    char buf[1024];
+    char buf[1280];
     snprintf(buf, sizeof(buf),
         "{\"status\":\"ok\",\"version\":\"%s\",\"pid\":%d,"
+        "\"server_name\":\"%s\","
         "\"base_addr\":\"0x%lx\",\"text_size_mb\":%zu,"
         "\"rw_regions\":%d,\"rw_total_mb\":%zu,"
         "\"engine_found\":%s,\"console_found\":%s,\"initialized\":%s,"
         "\"scan_stats\":{\"bytes_mb\":%zu,\"ptrs\":%zu,\"deref_ok\":%zu,\"deref_fail\":%zu}}",
         PALHOOK_VERSION, getpid(),
+        g_server_name[0] ? g_server_name : "",
         g_base_addr, g_text_size/(1024*1024),
         g_all_rw_count, g_total_rw_size/(1024*1024),
         g_GEngine ? "true" : "false",
@@ -4616,6 +4677,24 @@ static int collect_all_players(void) {
                 /* 关键过滤: 真实世界内的Actor才有Outer->Level->World链
                  * 蓝图模板/CDO等假对象没有, 对它们调ProcessEvent会崩游戏 */
                 if (!obj_belongs_to_world(val)) continue;
+                /* 关键过滤2: 必须有活的PlayerController才是在线玩家
+                 * (玩家下线后角色残留在内存里直到GC, 但Controller会被解除/销毁,
+                 *  否则空服也会显示有玩家) */
+                {
+                    uintptr_t cprop = find_property_in_struct(uc, "Controller");
+                    if (cprop) {
+                        int coff = prop_get_offset(cprop);
+                        uintptr_t ctrl = 0;
+                        if (coff < 0 ||
+                            safe_read_ptr(val + coff, &ctrl) != 0 || ctrl < 0x10000) continue;
+                        uintptr_t cvt = 0;
+                        if (safe_read_ptr(ctrl, &cvt) != 0 || !is_plausible_vtable(cvt)) continue;
+                        uintptr_t ccls = 0;
+                        if (safe_read_ptr(ctrl + 0x10, &ccls) != 0 || ccls < 0x10000) continue;
+                        uintptr_t ccv = 0;
+                        if (safe_read_ptr(ccls, &ccv) != 0 || !is_uclass_vtable(ccv)) continue;
+                    }
+                }
                 /* 去重 */
                 int dup = 0;
                 for (int d = 0; d < g_players_count; d++) {

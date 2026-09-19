@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import {
   palhookApi,
+  http,
   type ServerInfo,
   type RealtimeMetrics,
   type OnlinePlayer,
@@ -16,12 +17,13 @@ export const useServerStore = defineStore('server', () => {
 
   async function fetchInfo() {
     try {
-      const h = await palhookApi.health()
+      // 服务器名走后端 /dashboard/info (透传 PalHook /health 的 server_name)
+      const res = await http.get<ServerInfo>('/dashboard/info')
       serverInfo.value = {
-        version: h.data.version ?? '',
-        servername: 'PalHook 服务器',
-        description: '',
-        worldguid: '',
+        version: res.data.version ?? '',
+        servername: res.data.servername ?? '',
+        description: res.data.description ?? '',
+        worldguid: res.data.worldguid ?? '',
       }
     } catch {
       serverInfo.value = null

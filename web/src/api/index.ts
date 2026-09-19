@@ -230,4 +230,5 @@ export interface PalHookMetrics {
   version: string
 }
 
+export { http }
 export default http
