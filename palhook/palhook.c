@@ -29,7 +29,7 @@
 #include <sys/uio.h>   /* process_vm_readv: 读无效地址返回EFAULT而非触发SIGSEGV */
 
 #define PALHOOK_PORT 13335
-#define PALHOOK_VERSION "0.9.17"
+#define PALHOOK_VERSION "0.9.18"
 #define MAX_REQUEST 16384
 #define MAX_RESPONSE 262144
 #define LOG_PREFIX "[PalHook] "
@@ -199,6 +199,17 @@ static size_t bulk_read(uintptr_t addr, uint8_t* dst, size_t len) {
     struct iovec remote = { .iov_base = (void*)addr, .iov_len = len };
     ssize_t r = process_vm_readv(g_init_pid ? g_init_pid : getpid(), &local, 1, &remote, 1, 0);
     return r > 0 ? (size_t)r : 0;
+}
+
+/* 安全写远程内存: 经process_vm_writev, 写无效地址返EFAULT而非SIGSEGV
+ * (set-exp/set-tech 等直接改内存的接口原先用裸指针写, 目标对象被GC回收时一样会崩) */
+static int safe_write_mem(uintptr_t addr, const void* src, size_t len) {
+    if (addr < 0x10000 || len == 0 || len > 64) return -1;
+    if (!region_contains(addr) || !region_contains(addr + len - 1)) return -1;
+    struct iovec local = { .iov_base = (void*)src, .iov_len = len };
+    struct iovec remote = { .iov_base = (void*)addr, .iov_len = len };
+    ssize_t w = process_vm_writev(g_init_pid ? g_init_pid : getpid(), &local, 1, &remote, 1, 0);
+    return (w == (ssize_t)len) ? 0 : -1;
 }
 
 /* 在远程内存中安全搜索字节模式: 逐页经process_vm_readv拷入本地缓冲再memmem,
@@ -1622,6 +1633,7 @@ typedef struct {
     volatile int ready;
     volatile int done;
     volatile int result;
+    volatile int abandoned;   /* 调用方超时放弃: GameThread跳过执行, 调用方已释放params */
 } PendingCmd;
 
 static PendingCmd g_cmd_queue[CMD_QUEUE_SIZE];
@@ -1633,14 +1645,58 @@ static int g_hook_active = 0;
 /* 原始nanosleep函数指针 */
 static int (*g_real_nanosleep)(const struct timespec*, struct timespec*) = NULL;
 
-/* 处理命令队列 (在GameThread中调用) */
+/* ========== GameThread识别 (v0.9.18 重做) ========== */
+#define MAX_GT_CANDIDATES 8
+#define GT_WARMUP_SECS 3
+static struct { int tid; int count; } g_gt_cand[MAX_GT_CANDIDATES];
+static pthread_mutex_t g_gt_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile int g_game_tid = -1;   /* -1=探测中, >0=已确定, -2=兜底(任意线程) */
+static struct timespec g_gt_warmup_start = {0};
+
+static void gt_count_call(int tid) {
+    pthread_mutex_lock(&g_gt_lock);
+    for (int i = 0; i < MAX_GT_CANDIDATES; i++) {
+        if (g_gt_cand[i].tid == tid) { g_gt_cand[i].count++; pthread_mutex_unlock(&g_gt_lock); return; }
+        if (g_gt_cand[i].tid == 0) { g_gt_cand[i].tid = tid; g_gt_cand[i].count = 1; pthread_mutex_unlock(&g_gt_lock); return; }
+    }
+    pthread_mutex_unlock(&g_gt_lock);
+}
+
+static void gt_finish_detection(void) {
+    int best_tid = -1, best_count = 0;
+    pthread_mutex_lock(&g_gt_lock);
+    for (int i = 0; i < MAX_GT_CANDIDATES; i++) {
+        if (g_gt_cand[i].count > best_count) {
+            best_count = g_gt_cand[i].count;
+            best_tid = g_gt_cand[i].tid;
+        }
+    }
+    pthread_mutex_unlock(&g_gt_lock);
+    if (best_tid > 0) {
+        g_game_tid = best_tid;
+        g_hook_active = 1;
+        palhook_log("nanosleep hook: GameThread detected tid=%d (%d calls in %ds warmup)",
+            best_tid, best_count, GT_WARMUP_SECS);
+    } else {
+        /* 兜底: 探测窗口内没有线程调nanosleep (异常), 退化为任意线程处理 (旧行为) */
+        g_game_tid = -2;
+        g_hook_active = 1;
+        palhook_log("nanosleep hook: WARNING no nanosleep calls in warmup, fallback to any-thread mode");
+    }
+}
+
+/* 处理命令队列 (只在已识别的GameThread上调用) */
 static void process_cmd_queue(void) {
     if (g_cmd_head == g_cmd_tail) return;
 
     pthread_mutex_lock(&g_cmd_lock);
     while (g_cmd_head != g_cmd_tail) {
         PendingCmd* cmd = &g_cmd_queue[g_cmd_head];
-        if (cmd->ready && !cmd->done) {
+        /* abandoned: 调用方已超时并释放了params, 绝不能碰它 (碰了就是UAF崩游戏) */
+        if (cmd->ready && !cmd->done && cmd->abandoned) {
+            cmd->result = -2;
+            cmd->done = 1;
+        } else if (cmd->ready && !cmd->done) {
             palhook_log("GameThread: executing ProcessEvent obj=0x%lx func=0x%lx",
                 (uintptr_t)cmd->obj, (uintptr_t)cmd->ufunc);
 
@@ -1651,26 +1707,38 @@ static void process_cmd_queue(void) {
             sigaction(SIGSEGV, &sa_default, &sa_old);
             sigaction(SIGBUS, &sa_default, NULL);
 
-            /* 获取ProcessEvent函数地址 (obj可能已被释放, 用安全读) */
+            /* 执行前最后一道校验 (对象可能已释放/是扫描误报的垃圾指针,
+             * 直接ProcessEvent会崩整个游戏):
+             * obj vtable在镜像内 + obj的class是UClass + ufunc自身vtable合法 */
+            int ok = 0;
             uintptr_t obj_vt = 0;
-            if (safe_read_ptr((uintptr_t)cmd->obj, &obj_vt) != 0) {
-                palhook_log("GameThread: obj freed, skip ProcessEvent");
-                cmd->result = -1;
-            } else {
-                uintptr_t pe_addr = ((uintptr_t*)obj_vt)[PE_VTABLE_INDEX];
-
-                uintptr_t pe_lo = (g_base_addr > 0 ? g_base_addr : VPS_BASE_ADDR) + OFF_PE_LO;
-                uintptr_t pe_hi = (g_base_addr > 0 ? g_base_addr : VPS_BASE_ADDR) + OFF_PE_HI;
-                if (pe_addr > pe_lo && pe_addr < pe_hi) {
-                    ProcessEventFn pe = (ProcessEventFn)pe_addr;
-                    pe(cmd->obj, cmd->ufunc, cmd->params);
-                    cmd->result = 0;
-                    palhook_log("GameThread: ProcessEvent completed OK");
+            if (safe_read_ptr((uintptr_t)cmd->obj, &obj_vt) == 0 && is_plausible_vtable(obj_vt)) {
+                uintptr_t oc = 0, ocv = 0;
+                if (safe_read_ptr((uintptr_t)cmd->obj + 0x10, &oc) == 0 && oc > 0x10000 &&
+                    safe_read_ptr(oc, &ocv) == 0 && is_uclass_vtable(ocv)) {
+                    uintptr_t fv = 0;
+                    if (safe_read_ptr((uintptr_t)cmd->ufunc, &fv) == 0 && is_plausible_vtable(fv)) {
+                        uintptr_t pe_addr = ((uintptr_t*)obj_vt)[PE_VTABLE_INDEX];
+                        uintptr_t pe_lo = (g_base_addr > 0 ? g_base_addr : VPS_BASE_ADDR) + OFF_PE_LO;
+                        uintptr_t pe_hi = (g_base_addr > 0 ? g_base_addr : VPS_BASE_ADDR) + OFF_PE_HI;
+                        if (pe_addr > pe_lo && pe_addr < pe_hi) {
+                            ProcessEventFn pe = (ProcessEventFn)pe_addr;
+                            pe(cmd->obj, cmd->ufunc, cmd->params);
+                            ok = 1;
+                            palhook_log("GameThread: ProcessEvent completed OK");
+                        } else {
+                            palhook_log("GameThread: invalid ProcessEvent addr 0x%lx", pe_addr);
+                        }
+                    } else {
+                        palhook_log("GameThread: invalid ufunc 0x%lx, skip", (uintptr_t)cmd->ufunc);
+                    }
                 } else {
-                    palhook_log("GameThread: invalid ProcessEvent addr 0x%lx", pe_addr);
-                    cmd->result = -1;
+                    palhook_log("GameThread: obj 0x%lx freed/garbage, skip ProcessEvent", (uintptr_t)cmd->obj);
                 }
+            } else {
+                palhook_log("GameThread: obj 0x%lx vtable unreadable, skip", (uintptr_t)cmd->obj);
             }
+            cmd->result = ok ? 0 : -1;
 
             /* 恢复PalHook的信号处理 */
             sigaction(SIGSEGV, &sa_old, NULL);
@@ -1693,24 +1761,28 @@ int nanosleep(const struct timespec* req, struct timespec* rem) {
         g_real_nanosleep = (int(*)(const struct timespec*, struct timespec*))dlsym(RTLD_NEXT, "nanosleep");
     }
 
-    /* 只在PalServer进程的主线程中处理命令队列 */
+    /* 只在PalServer进程里处理命令队列 */
     if (g_init_pid != 0 && getpid() == g_init_pid && g_initialized) {
-        /* 简单的线程ID检查: nanosleep从GameThread调用时处理队列 */
-        static __thread int is_game_thread = -1;
-        if (is_game_thread == -1) {
-            /* 第一次调用，检测是否是频繁调用nanosleep的线程 */
-            static volatile int first_thread_set = 0;
-            if (!first_thread_set) {
-                first_thread_set = 1;
-                is_game_thread = 1;  /* 假设第一个调用nanosleep的是GameThread */
-                g_hook_active = 1;
-                palhook_log("nanosleep hook: GameThread detected (tid=%ld)", (long)syscall(SYS_gettid));
-            } else {
-                is_game_thread = 0;
+        int tid = (int)syscall(SYS_gettid);
+
+        /* GameThread识别: 游戏线程每帧调一次nanosleep(每秒60次量级), 工作线程偶尔调。
+         * 统计GT_WARMUP_SECS秒内各线程调用次数, 选最高者。
+         * "第一个调用者"启发式在弱服上会被异步加载/任务线程抢先 ->
+         * 之后所有ProcessEvent都跑在非游戏线程上, UE必崩 (刷等级/传送即崩的元凶之一) */
+        if (g_game_tid == -1) {
+            if (g_gt_warmup_start.tv_sec == 0) {
+                clock_gettime(CLOCK_MONOTONIC, &g_gt_warmup_start);
+            }
+            gt_count_call(tid);
+            struct timespec gt_now;
+            clock_gettime(CLOCK_MONOTONIC, &gt_now);
+            if (gt_now.tv_sec - g_gt_warmup_start.tv_sec >= GT_WARMUP_SECS) {
+                gt_finish_detection();
             }
         }
 
-        if (is_game_thread == 1) {
+        int is_gt = (g_game_tid > 0) ? (tid == g_game_tid) : (g_game_tid == -2);
+        if (is_gt) {
             /* 帧计数: GameThread每帧调一次nanosleep, 每秒结算为fps */
             time_t now = time(NULL);
             if (g_frame_ts == 0) g_frame_ts = now;
@@ -1727,7 +1799,7 @@ int nanosleep(const struct timespec* req, struct timespec* rem) {
     return g_real_nanosleep(req, rem);
 }
 
-/* 入队命令 (从HTTP线程调用) */
+/* 入队命令 (从HTTP线程调用), 返回槽位索引, 队列满返回-1 */
 static int enqueue_cmd(void* obj, void* ufunc, void* params) {
     pthread_mutex_lock(&g_cmd_lock);
     int next = (g_cmd_tail + 1) % CMD_QUEUE_SIZE;
@@ -1735,15 +1807,34 @@ static int enqueue_cmd(void* obj, void* ufunc, void* params) {
         pthread_mutex_unlock(&g_cmd_lock);
         return -1;
     }
-    g_cmd_queue[g_cmd_tail].obj = obj;
-    g_cmd_queue[g_cmd_tail].ufunc = ufunc;
-    g_cmd_queue[g_cmd_tail].params = params;
-    g_cmd_queue[g_cmd_tail].ready = 1;
-    g_cmd_queue[g_cmd_tail].done = 0;
-    g_cmd_queue[g_cmd_tail].result = -1;
+    int idx = g_cmd_tail;
+    g_cmd_queue[idx].obj = obj;
+    g_cmd_queue[idx].ufunc = ufunc;
+    g_cmd_queue[idx].params = params;
+    g_cmd_queue[idx].ready = 1;
+    g_cmd_queue[idx].done = 0;
+    g_cmd_queue[idx].result = -1;
+    g_cmd_queue[idx].abandoned = 0;
     g_cmd_tail = next;
     pthread_mutex_unlock(&g_cmd_lock);
-    return 0;
+    return idx;
+}
+
+/* 等待槽位命令执行 (必须用enqueue_cmd返回的slot, 不能用tail-1偷看:
+ * 并发入队+队列回绕会让tail-1指到别人的命令, 等待错槽位->提前释放还在队列里的params)。
+ * 返回: 命令的result (0=成功, 负=失败), -2=超时。
+ * 超时时在锁内把命令标记abandoned: GameThread见到abandoned会跳过执行,
+ * 因此调用方在wait_cmd返回后无条件free(params)永远是安全的。 */
+static int wait_cmd(int slot, int timeout_ms, int* waited_out) {
+    PendingCmd* cmd = &g_cmd_queue[slot];
+    int waited = 0;
+    while (!cmd->done && waited < timeout_ms) { usleep(10000); waited += 10; }
+    if (waited_out) *waited_out = waited;
+    if (cmd->done) return cmd->result;
+    pthread_mutex_lock(&g_cmd_lock);
+    if (!cmd->done) cmd->abandoned = 1;
+    pthread_mutex_unlock(&g_cmd_lock);
+    return -2;
 }
 
 /* ========== ProcessEvent调用核心 ========== */
@@ -2123,27 +2214,25 @@ static void api_call_function(int fd, const char* req) {
     }
 
     /* 入队到GameThread执行 */
-    if (enqueue_cmd(target_obj, ufunc, params_buf) != 0) {
+    int slot = enqueue_cmd(target_obj, ufunc, params_buf);
+    if (slot < 0) {
         if (params_buf) free(params_buf);
         json_err(fd, 503, "command queue full");
         return;
     }
 
-    /* 等待执行完成 (最多15秒) */
+    /* 等待执行完成 (最多15秒; 超时命令被标记abandoned, GameThread会跳过执行,
+     * 因此下方无条件free(params_buf)永远安全) */
     int wait_ms = 0;
-    PendingCmd* last_cmd = &g_cmd_queue[(g_cmd_tail - 1 + CMD_QUEUE_SIZE) % CMD_QUEUE_SIZE];
-    while (!last_cmd->done && wait_ms < 15000) {
-        usleep(10000);  /* 10ms */
-        wait_ms += 10;
-    }
+    int cmd_result = wait_cmd(slot, 15000, &wait_ms);
 
     char buf[512];
-    if (last_cmd->done) {
+    if (cmd_result != -2) {
         uint8_t ret_byte = params_buf ? ((uint8_t*)params_buf)[0] : 0;
         snprintf(buf, sizeof(buf),
             "{\"status\":\"%s\",\"obj\":\"0x%lx\",\"func\":\"%s\",\"ufunc\":\"0x%lx\","
             "\"parms_size\":%d,\"native_func\":\"0x%lx\",\"wait_ms\":%d,\"ret_byte\":%d}",
-            last_cmd->result == 0 ? "success" : "failed",
+            cmd_result == 0 ? "success" : "failed",
             (uintptr_t)target_obj, func_name, (uintptr_t)ufunc,
             parms_size, native_func, wait_ms, ret_byte);
     } else {
@@ -2345,7 +2434,8 @@ static void give_item_impl(int fd, const char* body) {
     params[20] = 1;
 
     /* 入队到GameThread执行 */
-    if (enqueue_cmd((void*)inv_obj, ufunc, params) != 0) {
+    int slot = enqueue_cmd((void*)inv_obj, ufunc, params);
+    if (slot < 0) {
         free(params);
         json_err(fd, 503, "command queue full");
         return;
@@ -2353,20 +2443,16 @@ static void give_item_impl(int fd, const char* body) {
 
     /* 等待执行完成 */
     int wait_ms = 0;
-    PendingCmd* last_cmd = &g_cmd_queue[(g_cmd_tail - 1 + CMD_QUEUE_SIZE) % CMD_QUEUE_SIZE];
-    while (!last_cmd->done && wait_ms < 15000) {
-        usleep(10000);
-        wait_ms += 10;
-    }
+    int cmd_result = wait_cmd(slot, 15000, &wait_ms);
 
     char buf[512];
-    if (last_cmd->done && last_cmd->result == 0) {
+    if (cmd_result == 0) {
         uint8_t ret_val = params[21]; /* ReturnValue at offset 0x15 */
         snprintf(buf, sizeof(buf),
             "{\"status\":\"success\",\"item_id\":\"%s\",\"fname_idx\":%d,"
             "\"count\":%d,\"inv\":\"0x%lx\",\"return_value\":%d,\"wait_ms\":%d}",
             item_id, item_fname_idx, count, inv_obj, ret_val, wait_ms);
-    } else if (last_cmd->done) {
+    } else if (cmd_result != -2) {
         snprintf(buf, sizeof(buf),
             "{\"status\":\"failed\",\"item_id\":\"%s\",\"message\":\"ProcessEvent returned error\"}",
             item_id);
@@ -2546,18 +2632,18 @@ static void api_give_exp(int fd, const char* req) {
     uint8_t* params = (uint8_t*)calloc(1, parms_size);
     *(int32_t*)params = exp;
 
-    if (enqueue_cmd((void*)ctrl, ufunc, params) != 0) {
+    int slot = enqueue_cmd((void*)ctrl, ufunc, params);
+    if (slot < 0) {
         free(params); json_err(fd, 503, "queue full"); return;
     }
 
     int wait_ms = 0;
-    PendingCmd* last = &g_cmd_queue[(g_cmd_tail - 1 + CMD_QUEUE_SIZE) % CMD_QUEUE_SIZE];
-    while (!last->done && wait_ms < 15000) { usleep(10000); wait_ms += 10; }
+    int cmd_result = wait_cmd(slot, 15000, &wait_ms);
 
     char buf[256];
     snprintf(buf, sizeof(buf),
         "{\"status\":\"%s\",\"exp\":%d,\"ctrl\":\"0x%lx\",\"wait_ms\":%d}",
-        (last->done && last->result == 0) ? "success" : "failed", exp, ctrl, wait_ms);
+        cmd_result == 0 ? "success" : "failed", exp, ctrl, wait_ms);
     free(params);
     json_ok(fd, buf);
 }
@@ -2654,16 +2740,16 @@ static int call_func_simple(uintptr_t obj, const char* func_name, void* params, 
         allocated = 1;
     }
 
-    if (enqueue_cmd((void*)obj, ufunc, params) != 0) {
+    int slot = enqueue_cmd((void*)obj, ufunc, params);
+    if (slot < 0) {
         if (allocated && params) free(params);
         return -3;
     }
 
     int wait_ms = 0;
-    PendingCmd* last = &g_cmd_queue[(g_cmd_tail - 1 + CMD_QUEUE_SIZE) % CMD_QUEUE_SIZE];
-    while (!last->done && wait_ms < 15000) { usleep(10000); wait_ms += 10; }
+    int cmd_result = wait_cmd(slot, 15000, &wait_ms);
 
-    int result = (last->done && last->result == 0) ? 0 : -4;
+    int result = (cmd_result == 0) ? 0 : -4;
     if (allocated && params) free(params);
     return result;
 }
@@ -3008,20 +3094,20 @@ static void api_cheat(int fd, const char* req) {
         return;
     }
 
-    if (enqueue_cmd((void*)ctrl, ufunc, params) != 0) {
+    int slot = enqueue_cmd((void*)ctrl, ufunc, params);
+    if (slot < 0) {
         free(params); free(str_buf);
         json_err(fd, 503, "queue full");
         return;
     }
 
     int wait_ms = 0;
-    PendingCmd* last = &g_cmd_queue[(g_cmd_tail - 1 + CMD_QUEUE_SIZE) % CMD_QUEUE_SIZE];
-    while (!last->done && wait_ms < 15000) { usleep(10000); wait_ms += 10; }
+    int cmd_result = wait_cmd(slot, 15000, &wait_ms);
 
     char buf[512];
     snprintf(buf, sizeof(buf),
         "{\"status\":\"%s\",\"cmd\":\"%s\",\"ctrl\":\"0x%lx\",\"wait_ms\":%d}",
-        (last->done && last->result == 0) ? "success" : "failed", cmd, ctrl, wait_ms);
+        cmd_result == 0 ? "success" : "failed", cmd, ctrl, wait_ms);
     free(params);
     free(str_buf);
     json_ok(fd, buf);
@@ -3113,14 +3199,18 @@ static void api_set_tech_points(int fd, const char* req) {
     safe_read_ptr(tech_data + 0x154, &tmp);
     old_boss = (int32_t)(tmp & 0xFFFFFFFF);
 
-    /* 直接写内存 */
-    if (set_tech && region_contains(tech_data + 0x150)) {
-        *(int32_t*)(tech_data + 0x150) = tech;
-        palhook_log("set-tech: TechnologyPoint %d -> %d", old_tech, tech);
+    /* 直接写内存 (process_vm_writev, 目标被回收时安全失败而非崩溃) */
+    if (set_tech) {
+        if (safe_write_mem(tech_data + 0x150, &tech, sizeof(tech)) == 0)
+            palhook_log("set-tech: TechnologyPoint %d -> %d", old_tech, tech);
+        else
+            palhook_log("set-tech: write TechnologyPoint failed");
     }
-    if (set_boss && region_contains(tech_data + 0x154)) {
-        *(int32_t*)(tech_data + 0x154) = boss_tech;
-        palhook_log("set-tech: bossTechnologyPoint %d -> %d", old_boss, boss_tech);
+    if (set_boss) {
+        if (safe_write_mem(tech_data + 0x154, &boss_tech, sizeof(boss_tech)) == 0)
+            palhook_log("set-tech: bossTechnologyPoint %d -> %d", old_boss, boss_tech);
+        else
+            palhook_log("set-tech: write bossTechnologyPoint failed");
     }
 
     char buf[256];
@@ -3301,21 +3391,21 @@ static void api_give_exp_v2(int fd, const char* req) {
         }
     }
 
-    if (enqueue_cmd((void*)pal_util_cdo, ufunc, params) != 0) {
+    int slot = enqueue_cmd((void*)pal_util_cdo, ufunc, params);
+    if (slot < 0) {
         free(params);
         json_err(fd, 503, "queue full");
         return;
     }
 
     int wait_ms = 0;
-    PendingCmd* last = &g_cmd_queue[(g_cmd_tail - 1 + CMD_QUEUE_SIZE) % CMD_QUEUE_SIZE];
-    while (!last->done && wait_ms < 15000) { usleep(10000); wait_ms += 10; }
+    int cmd_result = wait_cmd(slot, 15000, &wait_ms);
 
     char buf[256];
     snprintf(buf, sizeof(buf),
         "{\"status\":\"%s\",\"exp\":%d,\"method\":\"GiveExpToAroundPlayerCharacter\","
         "\"pal_utility\":\"0x%lx\",\"parms_size\":%d,\"wait_ms\":%d}",
-        (last->done && last->result == 0) ? "success" : "failed",
+        cmd_result == 0 ? "success" : "failed",
         exp, pal_util_cdo, parms_size, wait_ms);
     free(params);
     json_ok(fd, buf);
@@ -3379,13 +3469,9 @@ static int prop_get_name(uintptr_t prop, char* out, int out_size) {
 
 /* 入队+等待结果, waited_out返回等待毫秒数 */
 static int call_and_wait(void* obj, void* ufunc, void* params, int timeout_ms, int* waited_out) {
-    if (enqueue_cmd(obj, ufunc, params) != 0) return -1;
-    PendingCmd* last = &g_cmd_queue[(g_cmd_tail - 1 + CMD_QUEUE_SIZE) % CMD_QUEUE_SIZE];
-    int waited = 0;
-    while (!last->done && waited < timeout_ms) { usleep(10000); waited += 10; }
-    if (waited_out) *waited_out = waited;
-    if (!last->done) return -2;
-    return last->result;
+    int slot = enqueue_cmd(obj, ufunc, params);
+    if (slot < 0) return -1;
+    return wait_cmd(slot, timeout_ms, waited_out);
 }
 
 /* 扫描类名为指定名称的对象实例 (全部收集, 带vtable验证) */
@@ -3825,9 +3911,13 @@ static int actor_get_location(uintptr_t actor, double* out) {
     if (rl_off < 0) return -8;
     if (!region_contains(root + rl_off + 16)) return -9;
 
-    out[0] = *(double*)(root + rl_off + 0);
-    out[1] = *(double*)(root + rl_off + 8);
-    out[2] = *(double*)(root + rl_off + 16);
+    uintptr_t d0 = 0, d1 = 0, d2 = 0;
+    if (safe_read_ptr(root + rl_off + 0, &d0) != 0 ||
+        safe_read_ptr(root + rl_off + 8, &d1) != 0 ||
+        safe_read_ptr(root + rl_off + 16, &d2) != 0) return -10;
+    out[0] = *(double*)&d0;
+    out[1] = *(double*)&d1;
+    out[2] = *(double*)&d2;
     palhook_log("actor_get_location(mem): root=0x%lx off=0x%x -> (%.1f, %.1f, %.1f)",
         root, rl_off, out[0], out[1], out[2]);
     return 0;
@@ -4684,9 +4774,9 @@ static void api_set_exp(int fd, const char* req) {
         if (level < 1) level = 1;
         if (level > 50) level = 50;
         /* 等级字节在 +0x3F0 (实测: 低字节=等级, 高位是标志位, 只改低字节) */
-        if (region_contains(ip + 0x3F0)) {
-            volatile uint8_t* lv = (volatile uint8_t*)(ip + 0x3F0);
-            *lv = (uint8_t)level;
+        uint8_t lv = (uint8_t)level;
+        if (safe_write_mem(ip + 0x3F0, &lv, 1) != 0) {
+            palhook_log("set-exp: write level failed (stale IndividualParameter?)");
         }
     }
 
@@ -4701,8 +4791,8 @@ static void api_set_exp(int fd, const char* req) {
     }
     if (new_exp < 0) new_exp = 0;
 
-    if (region_contains(ip + 0x3F8) && region_contains(ip + 0x3FF)) {
-        *(volatile int64_t*)(ip + 0x3F8) = new_exp;
+    if (safe_write_mem(ip + 0x3F8, &new_exp, sizeof(new_exp)) != 0) {
+        palhook_log("set-exp: write exp failed (stale IndividualParameter?)");
     }
 
     char buf[320];
