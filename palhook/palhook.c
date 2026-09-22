@@ -29,7 +29,7 @@
 #include <sys/uio.h>   /* process_vm_readv: 读无效地址返回EFAULT而非触发SIGSEGV */
 
 #define PALHOOK_PORT 13335
-#define PALHOOK_VERSION "0.9.16"
+#define PALHOOK_VERSION "0.9.17"
 #define MAX_REQUEST 16384
 #define MAX_RESPONSE 262144
 #define LOG_PREFIX "[PalHook] "
@@ -190,6 +190,40 @@ static int safe_read_ptr(uintptr_t addr, uintptr_t* out) {
     return 0;
 }
 
+/* 整页安全读取: 经process_vm_readv把远程内存拷进本地缓冲。
+ * 页粒度原子 (映射的页全读/未映射返EFAULT), 让扫描循环对远程内存零裸读,
+ * 彻底消除"快照里有、读的时候已被unmap"的SIGSEGV竞态。
+ * 返回实际读取字节数 (页完整映射时==len) */
+static size_t bulk_read(uintptr_t addr, uint8_t* dst, size_t len) {
+    struct iovec local = { .iov_base = dst, .iov_len = len };
+    struct iovec remote = { .iov_base = (void*)addr, .iov_len = len };
+    ssize_t r = process_vm_readv(g_init_pid ? g_init_pid : getpid(), &local, 1, &remote, 1, 0);
+    return r > 0 ? (size_t)r : 0;
+}
+
+/* 在远程内存中安全搜索字节模式: 逐页经process_vm_readv拷入本地缓冲再memmem,
+ * 远程内存全程零裸读, 页被unmap时跳过继续。返回远程绝对地址偏移, 未找到返回-1。
+ * needle_len上限64 (够FName/配置模式用) */
+static long safe_memmem_remote(uintptr_t addr, size_t len, const uint8_t* needle, size_t needle_len) {
+    if (needle_len == 0 || needle_len > 64 || len < needle_len) return -1;
+    uint8_t buf[4096 + 64];
+    size_t carry = needle_len - 1;   /* 保留上一页尾部, 匹配跨页模式 */
+    size_t have = 0;
+    for (uintptr_t page = addr; page < addr + len; page += 4096) {
+        size_t chunk = (addr + len - page) < 4096 ? (addr + len - page) : 4096;
+        if (have > 0) memmove(buf, buf + have - carry, carry);
+        if (bulk_read(page, buf + carry, chunk) != chunk) { have = 0; continue; }
+        have = carry + chunk;
+        uint8_t* hit = (uint8_t*)memmem(buf, have, needle, needle_len);
+        if (hit) {
+            long off = (long)(hit - buf) - (long)carry;
+            if (off < 0) off = 0; /* 重叠区命中上一轮已返回, 理论到不了这里 */
+            return (long)page + off;
+        }
+    }
+    return -1;
+}
+
 /* 区域列表快照 (扫描器用, 避免与parse_proc_maps并发撕裂) */
 static int snapshot_rw(uintptr_t (*dst)[2], int max_n) {
     pthread_mutex_lock(&g_maps_lock);
@@ -318,22 +352,22 @@ static int scan_memory_for_admin_password(void) {
     int seg_count = snapshot_rw(segs, MAX_RW_REGIONS);
 
     /* 第一遍: 宽字符模式 (UE FConfigFile原文是UTF-16 FString, 值未编码) */
+    uint8_t win[512];
     for (int seg = 0; seg < seg_count; seg++) {
-        uint8_t* base = (uint8_t*)segs[seg][0];
-        size_t size = segs[seg][1] - segs[seg][0];
+        uintptr_t seg_start = segs[seg][0];
+        uintptr_t seg_end = segs[seg][1];
+        size_t size = seg_end - seg_start;
         if (size < 64) continue;
         /* ServerName (支持中文: UTF-16转UTF-8) */
         if (!g_server_name[0]) {
-            uint8_t* sf = (uint8_t*)memmem(base, size, pat_wide_sn, sizeof(pat_wide_sn));
-            if (sf) {
-                uint8_t* p = sf + sizeof(pat_wide_sn);
+            long hit = safe_memmem_remote(seg_start, size, pat_wide_sn, sizeof(pat_wide_sn));
+            if (hit >= 0 && bulk_read(seg_start + (size_t)hit + sizeof(pat_wide_sn), win, sizeof(win)) > 2) {
                 uint16_t ubuf[128];
                 int un = 0;
-                while (un < 127 && (uintptr_t)(p + 1) < segs[seg][1]) {
-                    uint16_t ch = (uint16_t)(p[0] | (p[1] << 8));
+                for (int p = 0; p + 1 < (int)sizeof(win) && un < 127; p += 2) {
+                    uint16_t ch = (uint16_t)(win[p] | (win[p + 1] << 8));
                     if (ch == '"' || ch == 0) break;
                     ubuf[un++] = ch;
-                    p += 2;
                 }
                 if (un > 0 && utf16_to_utf8(ubuf, un, g_server_name, sizeof(g_server_name)) > 0) {
                     palhook_log("loaded ServerName from memory wide (%s)", g_server_name);
@@ -342,16 +376,14 @@ static int scan_memory_for_admin_password(void) {
         }
         /* AdminPassword */
         if (!g_admin_password[0]) {
-            uint8_t* wf = (uint8_t*)memmem(base, size, pat_wide, sizeof(pat_wide));
-            if (wf) {
-                uint8_t* p = wf + sizeof(pat_wide);
+            long hit = safe_memmem_remote(seg_start, size, pat_wide, sizeof(pat_wide));
+            if (hit >= 0 && bulk_read(seg_start + (size_t)hit + sizeof(pat_wide), win, sizeof(win)) > 2) {
                 char out[128]; int o = 0;
-                while (o < 127 && (uintptr_t)(p + 1) < segs[seg][1]) {
-                    uint16_t ch = (uint16_t)(p[0] | (p[1] << 8));
+                for (int p = 0; p + 1 < (int)sizeof(win) && o < 127; p += 2) {
+                    uint16_t ch = (uint16_t)(win[p] | (win[p + 1] << 8));
                     if (ch == '"' || ch == 0) break;
                     if (ch >= 0x80) break;
                     out[o++] = (char)ch;
-                    p += 2;
                 }
                 out[o] = 0;
                 if (o > 0) {
@@ -362,18 +394,20 @@ static int scan_memory_for_admin_password(void) {
     }
 
     /* 第二遍: 窄字节模式 (某些缓存放未编码ASCII) */
+    uint8_t nbuf[256];
     for (int seg = 0; seg < seg_count; seg++) {
-        uint8_t* base = (uint8_t*)segs[seg][0];
-        size_t size = segs[seg][1] - segs[seg][0];
+        uintptr_t seg_start = segs[seg][0];
+        uintptr_t seg_end = segs[seg][1];
+        size_t size = seg_end - seg_start;
         if (size < 64) continue;
         /* ServerName */
         if (!g_server_name[0]) {
-            uint8_t* sf = (uint8_t*)memmem(base, size, pat_narrow_sn, sizeof(pat_narrow_sn) - 1);
-            if (sf) {
-                uint8_t* p = sf + sizeof(pat_narrow_sn) - 1;
+            long hit = safe_memmem_remote(seg_start, size, (const uint8_t*)pat_narrow_sn, sizeof(pat_narrow_sn) - 1);
+            if (hit >= 0 && bulk_read(seg_start + (size_t)hit + sizeof(pat_narrow_sn) - 1, nbuf, sizeof(nbuf)) > 0) {
                 int o = 0;
-                while (o < 255 && (uintptr_t)p < segs[seg][1] && *p != '"' && *p != 0) {
-                    g_server_name[o++] = (char)*p++;
+                while (o < 255 && nbuf[o] != '"' && nbuf[o] != 0) {
+                    g_server_name[o] = (char)nbuf[o];
+                    o++;
                 }
                 g_server_name[o] = 0;
                 if (o > 0) palhook_log("loaded ServerName from memory narrow (%s)", g_server_name);
@@ -381,12 +415,11 @@ static int scan_memory_for_admin_password(void) {
         }
         /* AdminPassword */
         if (!g_admin_password[0]) {
-            uint8_t* found = (uint8_t*)memmem(base, size, pat_narrow, sizeof(pat_narrow) - 1);
-            if (found) {
-                uint8_t* p = found + sizeof(pat_narrow) - 1;
+            long hit = safe_memmem_remote(seg_start, size, (const uint8_t*)pat_narrow, sizeof(pat_narrow) - 1);
+            if (hit >= 0 && bulk_read(seg_start + (size_t)hit + sizeof(pat_narrow) - 1, nbuf, sizeof(nbuf)) > 0) {
                 char out[128]; int o = 0;
-                while (o < 127 && (uintptr_t)p < segs[seg][1] && *p != '"' && *p != 0) {
-                    out[o++] = (char)*p++;
+                while (o < 127 && nbuf[o] != '"' && nbuf[o] != 0) {
+                    out[o++] = (char)nbuf[o];
                 }
                 out[o] = 0;
                 if (o > 0) {
@@ -685,14 +718,19 @@ static int discover_ue_globals(void) {
 
     uintptr_t segs[MAX_RW_REGIONS][2];
     int seg_count = snapshot_rw(segs, MAX_RW_REGIONS);
+    uint8_t scan_buf[4096];
     for (int seg = 0; seg < seg_count; seg++) {
         uintptr_t scan_start = segs[seg][0];
         uintptr_t scan_end = segs[seg][1];
         size_t seg_size = scan_end - scan_start;
-        uintptr_t* ptr = (uintptr_t*)scan_start;
-        size_t count = seg_size / sizeof(uintptr_t);
 
         g_scan_bytes += seg_size;
+
+        for (uintptr_t page = scan_start; page < scan_end; page += 4096) {
+        size_t chunk = (scan_end - page) < 4096 ? (scan_end - page) : 4096;
+        if (bulk_read(page, scan_buf, chunk) != chunk) continue;
+        uintptr_t* ptr = (uintptr_t*)scan_buf;
+        size_t count = chunk / sizeof(uintptr_t);
 
         for (size_t i = 0; i < count; i++) {
             uintptr_t val = ptr[i];
@@ -710,7 +748,7 @@ static int discover_ue_globals(void) {
             g_scan_deref_ok++;
 
             if ((first_qword == VTABLE_UPalGameEngine || first_qword == VTABLE_UGameEngine) && !g_GEngine) {
-                g_GEngine = (void**)&ptr[i];
+                g_GEngine = (void**)(page + (uintptr_t)i * sizeof(uintptr_t));
                 palhook_log("  >>> FOUND GEngine at 0x%lx -> obj=0x%lx (vt=0x%lx, region %d: 0x%lx-0x%lx)",
                     (uintptr_t)g_GEngine, val, first_qword, seg, scan_start, scan_end);
             }
@@ -721,6 +759,7 @@ static int discover_ue_globals(void) {
             }
 
             if (g_GEngine && g_ConsoleManager) goto done;
+            }
         }
     }
 
@@ -1107,23 +1146,28 @@ static void api_search_bytes(int fd, const char* req) {
         size_t seg_size = scan_end - scan_start;
         if (seg_size < (size_t)pat_len) continue;
 
-        const uint8_t* mem = (const uint8_t*)scan_start;
-        for (size_t i = 0; i <= seg_size - pat_len && found < max_results; i++) {
-            if (mem[i] == pattern[0] && memcmp(mem + i, pattern, pat_len) == 0) {
-                uintptr_t match_addr = scan_start + i;
-                if (found > 0) buf[pos++] = ',';
+        long sb_off = 0;
+        while (sb_off >= 0 && found < max_results) {
+            long sb_hit = safe_memmem_remote(scan_start + (size_t)sb_off,
+                seg_size - (size_t)sb_off, pattern, (size_t)pat_len);
+            if (sb_hit < 0) break;
+            sb_off = sb_hit + 1;
+            uintptr_t match_addr = scan_start + (size_t)sb_hit;
+            if (found > 0) buf[pos++] = ',';
                 /* 输出匹配地址和后续16字节的hex */
                 pos += snprintf(buf + pos, 65536 - pos,
                     "{\"addr\":\"0x%lx\",\"region\":%d", match_addr, seg);
                 /* 显示上下文字节 */
                 pos += snprintf(buf + pos, 65536 - pos, ",\"context\":\"");
-                int ctx = (i + 32 <= seg_size) ? 32 : (int)(seg_size - i);
-                for (int j = 0; j < ctx && pos < 65000; j++) {
-                    pos += snprintf(buf + pos, 65536 - pos, "%02x", mem[i + j]);
+                uint8_t sb_ctx[32];
+                size_t sb_want = seg_size - (size_t)sb_hit;
+                if (sb_want > 32) sb_want = 32;
+                size_t sb_ctx_read = bulk_read(match_addr, sb_ctx, sb_want);
+                for (size_t j = 0; j < sb_ctx_read && pos < 65000; j++) {
+                    pos += snprintf(buf + pos, 65536 - pos, "%02x", sb_ctx[j]);
                 }
                 pos += snprintf(buf + pos, 65536 - pos, "\"}");
                 found++;
-            }
         }
     }
 
@@ -1167,39 +1211,46 @@ static int discover_fnamepool(void) {
         size_t size = end - start;
         if (size < 64) continue;
 
-        const uint8_t* mem = (const uint8_t*)start;
-        for (size_t i = 0; i < size - 32; i++) {
-            /* Look for "None" at this position */
-            if (memcmp(mem + i, none_str, 4) != 0) continue;
+        uint8_t chunk_buf[4096];
+        for (uintptr_t page = start; page < end; page += 4096) {
+            size_t chunk = (end - page) < 4096 ? (end - page) : 4096;
+            if (bulk_read(page, chunk_buf, chunk) != chunk) continue;
+            for (size_t i = 0; i + 32 < chunk; i++) {
+                /* Look for "None" at this position */
+                if (memcmp(chunk_buf + i, none_str, 4) != 0) continue;
 
-            /* Check header before "None": 2 bytes before, header>>6 should be 4 */
-            if (i < 2) continue;
-            uint16_t h = *(uint16_t*)(mem + i - 2);
-            if ((h >> 6) != 4) continue;
+                /* Check header before "None": 2 bytes before, header>>6 should be 4 */
+                if (i < 2) continue;
+                uint16_t h = *(uint16_t*)(chunk_buf + i - 2);
+                if ((h >> 6) != 4) continue;
 
-            /* Now look for "ByteProperty" within next 20 bytes */
-            for (size_t j = i + 4; j < i + 20 && j + 12 <= size; j++) {
-                if (memcmp(mem + j, byte_prop, 12) != 0) continue;
-                /* Verify header before "ByteProperty" */
-                if (j < 2) continue;
-                uint16_t h2 = *(uint16_t*)(mem + j - 2);
-                if ((h2 >> 6) != 12) continue;
+                /* Now look for "ByteProperty" within next 20 bytes */
+                for (size_t j = i + 4; j < i + 20 && j + 12 <= chunk; j++) {
+                    if (memcmp(chunk_buf + j, byte_prop, 12) != 0) continue;
+                    /* Verify header before "ByteProperty" */
+                    if (j < 2) continue;
+                    uint16_t h2 = *(uint16_t*)(chunk_buf + j - 2);
+                    if ((h2 >> 6) != 12) continue;
 
-                /* Found it! Block[0] starts at header of "None" entry */
-                uintptr_t block0_start = start + i - 2;
-                palhook_log("  found FName block: 'None' at 0x%lx, 'ByteProperty' at 0x%lx",
-                    start + i, start + j);
+                    /* Found it! Block[0] starts at header of "None" entry */
+                    uintptr_t block0_start = page + i - 2;
+                    palhook_log("  found FName block: 'None' at 0x%lx, 'ByteProperty' at 0x%lx",
+                        page + i, page + j);
                 palhook_log("  Block[0] = 0x%lx", block0_start);
 
                 /* Now find pointer to block0_start in BSS/rw regions */
+                uint8_t bsbuf[4096];
                 for (int bseg = 0; bseg < g_all_rw_count; bseg++) {
                     uintptr_t bs = g_all_rw[bseg][0];
                     uintptr_t be = g_all_rw[bseg][1];
-                    uintptr_t* ptr = (uintptr_t*)bs;
-                    size_t cnt = (be - bs) / sizeof(uintptr_t);
-                    for (size_t k = 0; k < cnt; k++) {
-                        if (ptr[k] == block0_start) {
-                            uintptr_t blocks_ptr = (uintptr_t)&ptr[k];
+                    for (uintptr_t bpage = bs; bpage < be; bpage += 4096) {
+                        size_t bchunk = (be - bpage) < 4096 ? (be - bpage) : 4096;
+                        if (bulk_read(bpage, bsbuf, bchunk) != bchunk) continue;
+                        uintptr_t* ptr = (uintptr_t*)bsbuf;
+                        size_t cnt = bchunk / sizeof(uintptr_t);
+                        for (size_t k = 0; k < cnt; k++) {
+                            if (ptr[k] == block0_start) {
+                                uintptr_t blocks_ptr = bpage + (uintptr_t)k * sizeof(uintptr_t);
                             g_FNamePool = blocks_ptr - 16; /* -16 for Lock + CurrentBlock/Cursor */
                             palhook_log("  FOUND FNamePool: Blocks[0] ptr at 0x%lx", blocks_ptr);
                             palhook_log("  FNamePool at 0x%lx", g_FNamePool);
@@ -1216,12 +1267,14 @@ static int discover_fnamepool(void) {
                             }
                             /* Verification failed, keep searching */
                             g_FNamePool = 0;
+                            }
                         }
                     }
                 }
 
                 /* If no pointer found in BSS, the Blocks array might be at a different offset */
                 palhook_log("  WARNING: Block[0] found but no Blocks[] pointer in BSS");
+                }
             }
         }
     }
@@ -1281,13 +1334,13 @@ static void api_fname(int fd, const char* req) {
         return;
     }
 
-    uint16_t header = *(uint16_t*)entry_addr;
+    uint16_t header = (uint16_t)(raw & 0xFFFF);
     int name_len = header >> 6;
     int is_wide = header & 1;
 
     char name[512] = {0};
     if (name_len > 0 && name_len < 500 && !is_wide) {
-        memcpy(name, (void*)(entry_addr + 2), name_len);
+        bulk_read(entry_addr + 2, (uint8_t*)name, (size_t)name_len);
     }
 
     char buf[1024];
@@ -1349,14 +1402,15 @@ static void api_fname_search(int fd, const char* req) {
             uintptr_t raw = 0;
             if (safe_read_ptr(entry, &raw) != 0) break;
 
-            uint16_t header = *(uint16_t*)entry;
+            uint16_t header = (uint16_t)(raw & 0xFFFF);
             int elen = header >> 6;
             if (elen != search_len) continue;
             if (header & 1) continue; /* skip wide */
 
-            /* 比较字符串 */
-            const char* estr = (const char*)(entry + 2);
-            if (memcmp(estr, search_name, search_len) == 0) {
+            /* 比较字符串 (经bulk_read拷入本地缓冲) */
+            char ebuf[256];
+            if (bulk_read(entry + 2, (uint8_t*)ebuf, (size_t)elen) != (size_t)elen) continue;
+            if (memcmp(ebuf, search_name, search_len) == 0) {
                 int fname_idx = (blk << 16) | off;
                 if (found > 0) buf[pos++] = ',';
                 pos += snprintf(buf + pos, 8192 - pos,
@@ -1404,11 +1458,16 @@ static void api_find_vtable(int fd, const char* req) {
         "{\"target_vt\":\"0x%lx\",\"results\":[", target_vt);
 
     int found = 0;
+    uint8_t vtsbuf[4096];
     for (int seg = 0; seg < g_all_rw_count && found < max_results; seg++) {
         uintptr_t scan_start = g_all_rw[seg][0];
         uintptr_t scan_end = g_all_rw[seg][1];
-        uintptr_t* ptr = (uintptr_t*)scan_start;
-        size_t count = (scan_end - scan_start) / sizeof(uintptr_t);
+
+        for (uintptr_t page = scan_start; page < scan_end; page += 4096) {
+        size_t chunk = (scan_end - page) < 4096 ? (scan_end - page) : 4096;
+        if (bulk_read(page, vtsbuf, chunk) != chunk) continue;
+        uintptr_t* ptr = (uintptr_t*)vtsbuf;
+        size_t count = chunk / sizeof(uintptr_t);
 
         for (size_t i = 0; i < count && found < max_results; i++) {
             uintptr_t val = ptr[i];
@@ -1418,13 +1477,14 @@ static void api_find_vtable(int fd, const char* req) {
             if (safe_read_ptr(val, &first_qword) != 0) continue;
 
             if (first_qword == target_vt) {
-                uintptr_t ptr_addr = (uintptr_t)&ptr[i];
+                uintptr_t ptr_addr = page + (uintptr_t)i * sizeof(uintptr_t);
                 if (found > 0) buf[pos++] = ',';
                 pos += snprintf(buf + pos, 65536 - pos,
                     "{\"ptr_at\":\"0x%lx\",\"obj\":\"0x%lx\",\"region\":%d}",
                     ptr_addr, val, seg);
                 found++;
                 palhook_log("  found: ptr=0x%lx -> obj=0x%lx (region %d)", ptr_addr, val, seg);
+            }
             }
         }
     }
@@ -1493,11 +1553,16 @@ static void api_find_class(int fd, const char* req) {
         "{\"class\":\"%s\",\"fname_idx\":%d,\"results\":[", class_name, target_fname_idx);
 
     int found = 0;
+    uint8_t fcsbuf[4096];
     for (int seg = 0; seg < g_all_rw_count && found < max_results; seg++) {
         uintptr_t scan_start = g_all_rw[seg][0];
         uintptr_t scan_end = g_all_rw[seg][1];
-        uintptr_t* ptr = (uintptr_t*)scan_start;
-        size_t count = (scan_end - scan_start) / sizeof(uintptr_t);
+
+        for (uintptr_t page = scan_start; page < scan_end; page += 4096) {
+        size_t chunk = (scan_end - page) < 4096 ? (scan_end - page) : 4096;
+        if (bulk_read(page, fcsbuf, chunk) != chunk) continue;
+        uintptr_t* ptr = (uintptr_t*)fcsbuf;
+        size_t count = chunk / sizeof(uintptr_t);
 
         for (size_t i = 0; i < count && found < max_results; i++) {
             uintptr_t val = ptr[i];
@@ -1525,7 +1590,7 @@ static void api_find_class(int fd, const char* req) {
             /* 跳过Default__开头的CDO */
             if (strncmp(obj_name, "Default__", 9) == 0) continue;
 
-            uintptr_t ptr_addr = (uintptr_t)&ptr[i];
+            uintptr_t ptr_addr = page + (uintptr_t)i * sizeof(uintptr_t);
             if (found > 0) buf[pos++] = ',';
             pos += snprintf(buf + pos, 65536 - pos,
                 "{\"ptr_at\":\"0x%lx\",\"obj\":\"0x%lx\",\"name\":\"%s\",\"class_addr\":\"0x%lx\"}",
@@ -1533,6 +1598,7 @@ static void api_find_class(int fd, const char* req) {
             found++;
 
             palhook_log("  found: 0x%lx name='%s' class=0x%lx", val, obj_name, uclass);
+            }
         }
     }
 
@@ -1585,20 +1651,25 @@ static void process_cmd_queue(void) {
             sigaction(SIGSEGV, &sa_default, &sa_old);
             sigaction(SIGBUS, &sa_default, NULL);
 
-            /* 获取ProcessEvent函数地址 */
-            uintptr_t obj_vt = *(uintptr_t*)cmd->obj;
-            uintptr_t pe_addr = ((uintptr_t*)obj_vt)[PE_VTABLE_INDEX];
-
-            uintptr_t pe_lo = (g_base_addr > 0 ? g_base_addr : VPS_BASE_ADDR) + OFF_PE_LO;
-            uintptr_t pe_hi = (g_base_addr > 0 ? g_base_addr : VPS_BASE_ADDR) + OFF_PE_HI;
-            if (pe_addr > pe_lo && pe_addr < pe_hi) {
-                ProcessEventFn pe = (ProcessEventFn)pe_addr;
-                pe(cmd->obj, cmd->ufunc, cmd->params);
-                cmd->result = 0;
-                palhook_log("GameThread: ProcessEvent completed OK");
-            } else {
-                palhook_log("GameThread: invalid ProcessEvent addr 0x%lx", pe_addr);
+            /* 获取ProcessEvent函数地址 (obj可能已被释放, 用安全读) */
+            uintptr_t obj_vt = 0;
+            if (safe_read_ptr((uintptr_t)cmd->obj, &obj_vt) != 0) {
+                palhook_log("GameThread: obj freed, skip ProcessEvent");
                 cmd->result = -1;
+            } else {
+                uintptr_t pe_addr = ((uintptr_t*)obj_vt)[PE_VTABLE_INDEX];
+
+                uintptr_t pe_lo = (g_base_addr > 0 ? g_base_addr : VPS_BASE_ADDR) + OFF_PE_LO;
+                uintptr_t pe_hi = (g_base_addr > 0 ? g_base_addr : VPS_BASE_ADDR) + OFF_PE_HI;
+                if (pe_addr > pe_lo && pe_addr < pe_hi) {
+                    ProcessEventFn pe = (ProcessEventFn)pe_addr;
+                    pe(cmd->obj, cmd->ufunc, cmd->params);
+                    cmd->result = 0;
+                    palhook_log("GameThread: ProcessEvent completed OK");
+                } else {
+                    palhook_log("GameThread: invalid ProcessEvent addr 0x%lx", pe_addr);
+                    cmd->result = -1;
+                }
             }
 
             /* 恢复PalHook的信号处理 */
@@ -1698,14 +1769,14 @@ static int resolve_fname(int idx, char* out, int out_size) {
     uintptr_t raw = 0;
     if (safe_read_ptr(entry, &raw) != 0) return -1;
 
-    uint16_t header = *(uint16_t*)entry;
+    uint16_t header = (uint16_t)(raw & 0xFFFF);
     int len = header >> 6;
     if (len <= 0 || len >= out_size) return -1;
 
     /* 区域校验: 字符串字节必须在映射内 (无信号处理器兜底了) */
     if (!region_contains(entry + 2) || !region_contains(entry + 2 + (uintptr_t)len)) return -1;
 
-    memcpy(out, (void*)(entry + 2), len);
+    if (bulk_read(entry + 2, (uint8_t*)out, (size_t)len) != (size_t)len) return -1;
     out[len] = '\0';
     return len;
 }
@@ -1750,22 +1821,22 @@ static int find_fname_index(const char* target_name) {
         }
         if (block_size < 64) continue;
 
-        uint8_t* base = (uint8_t*)block_ptr;
-        uint8_t* search = base;
-        size_t remain = block_size;
-
-        while (remain > (size_t)(target_len + 2)) {
-            uint8_t* found = (uint8_t*)memmem(search, remain, target_name, target_len);
-            if (!found) break;
+        long off = 0;
+        while ((size_t)off + (size_t)target_len + 2 < block_size) {
+            long hit = safe_memmem_remote(block_ptr + (size_t)off, block_size - (size_t)off,
+                (const uint8_t*)target_name, (size_t)target_len);
+            if (hit < 0) break;
+            off = hit + 1;
+            uintptr_t found = block_ptr + (size_t)hit;
 
             /* 验证header: found-2处的uint16, header>>6应该等于target_len */
-            if (found >= base + 2) {
-                uint16_t header = *(uint16_t*)(found - 2);
+            uint16_t header = 0;
+            if (hit >= 2 && bulk_read(found - 2, (uint8_t*)&header, 2) == 2) {
                 int hdr_len = header >> 6;
                 int is_wide = header & 1;
 
                 if (hdr_len == target_len && !is_wide) {
-                    uintptr_t entry_addr = (uintptr_t)(found - 2);
+                    uintptr_t entry_addr = found - 2;
                     int byte_offset = (int)(entry_addr - block_ptr);
                     int fname_offset = byte_offset / 2;
                     int fname_index = (block << 16) | fname_offset;
@@ -1778,11 +1849,6 @@ static int find_fname_index(const char* target_name) {
                     return fname_index;
                 }
             }
-
-            /* 继续搜索 */
-            size_t skip = (found - search) + 1;
-            search = found + 1;
-            remain -= skip;
         }
     }
 
@@ -1805,19 +1871,19 @@ static int find_fname_index(const char* target_name) {
             }
             if (block_size < 64) continue;
 
-            uint8_t* base = (uint8_t*)block_ptr;
-            uint8_t* search = base;
-            size_t remain = block_size;
-
-            while (remain > (size_t)(target_len * 2 + 2)) {
-                uint8_t* found = (uint8_t*)memmem(search, remain, wide_pat, target_len * 2);
-                if (!found) break;
-                if (found >= base + 2) {
-                    uint16_t header = *(uint16_t*)(found - 2);
+            long off = 0;
+            while ((size_t)off + (size_t)target_len * 2 + 2 < block_size) {
+                long hit = safe_memmem_remote(block_ptr + (size_t)off, block_size - (size_t)off,
+                    wide_pat, (size_t)target_len * 2);
+                if (hit < 0) break;
+                off = hit + 1;
+                uintptr_t found = block_ptr + (size_t)hit;
+                uint16_t header = 0;
+                if (hit >= 2 && bulk_read(found - 2, (uint8_t*)&header, 2) == 2) {
                     int hdr_len = header >> 6;
                     int is_wide = header & 1;
                     if (hdr_len == target_len && is_wide) {
-                        uintptr_t entry_addr = (uintptr_t)(found - 2);
+                        uintptr_t entry_addr = found - 2;
                         int byte_offset = (int)(entry_addr - block_ptr);
                         int fname_offset = byte_offset / 2;
                         int fname_index = (block << 16) | fname_offset;
@@ -1830,9 +1896,6 @@ static int find_fname_index(const char* target_name) {
                         return fname_index;
                     }
                 }
-                size_t skip = (found - search) + 1;
-                search = found + 1;
-                remain -= skip;
             }
         }
     }
@@ -1958,8 +2021,13 @@ static void api_call_function(int fd, const char* req) {
         /* 查找CheatManager实例 */
         uintptr_t cm_vt = (g_base_addr > 0 ? g_base_addr : VPS_BASE_ADDR) + OFF_VTABLE_UCHEATMANAGER;  /* UCheatManager vtable+16 */
         for (int seg = 0; seg < g_all_rw_count && !target_obj; seg++) {
-            uintptr_t* ptr = (uintptr_t*)g_all_rw[seg][0];
-            size_t cnt = (g_all_rw[seg][1] - g_all_rw[seg][0]) / sizeof(uintptr_t);
+        {
+            uint8_t buf[4096];
+            for (uintptr_t page = g_all_rw[seg][0]; page < g_all_rw[seg][1]; page += 4096) {
+                size_t chunk = (g_all_rw[seg][1] - page) < 4096 ? (g_all_rw[seg][1] - page) : 4096;
+                if (bulk_read(page, buf, chunk) != chunk) continue; /* 页面已unmap, 跳过 */
+                uintptr_t* ptr = (uintptr_t*)buf;
+                size_t cnt = chunk / sizeof(uintptr_t);
             for (size_t i = 0; i < cnt; i++) {
                 uintptr_t val = ptr[i];
                 if (val < 0x10000 || val > 0x800000000000UL) continue;
@@ -1972,6 +2040,8 @@ static void api_call_function(int fd, const char* req) {
                     break;
                 }
             }
+            }
+        }
         }
     } else if (strcmp(obj_type, "engine") == 0 && g_GEngine) {
         target_obj = *g_GEngine;
@@ -2188,8 +2258,13 @@ static void give_item_impl(int fd, const char* body) {
         int inv_fname_idx = find_fname_index("BP_PalPlayerInventoryData_C");
         if (inv_fname_idx > 0 && g_all_rw_count > 0) {
             for (int seg = 0; seg < g_all_rw_count && inv_obj == 0; seg++) {
-                uintptr_t* ptr = (uintptr_t*)g_all_rw[seg][0];
-                size_t cnt = (g_all_rw[seg][1] - g_all_rw[seg][0]) / sizeof(uintptr_t);
+        {
+            uint8_t buf[4096];
+            for (uintptr_t page = g_all_rw[seg][0]; page < g_all_rw[seg][1]; page += 4096) {
+                size_t chunk = (g_all_rw[seg][1] - page) < 4096 ? (g_all_rw[seg][1] - page) : 4096;
+                if (bulk_read(page, buf, chunk) != chunk) continue; /* 页面已unmap, 跳过 */
+                uintptr_t* ptr = (uintptr_t*)buf;
+                size_t cnt = chunk / sizeof(uintptr_t);
                 for (size_t i = 0; i < cnt; i++) {
                     uintptr_t val = ptr[i];
                     if (val < 0x10000 || val > 0x800000000000UL) continue;
@@ -2210,11 +2285,13 @@ static void give_item_impl(int fd, const char* body) {
                     }
                 }
             }
+            }
         }
         if (inv_obj == 0) {
             json_err(fd, 404, "no player InventoryData found, pass 'inv' or ensure a player is online");
             return;
         }
+    }
     }
 
     palhook_log("give-item: item='%s' count=%d inv=0x%lx", item_id, count, inv_obj);
@@ -2341,9 +2418,16 @@ static void api_find_players(int fd, const char* req) {
     uintptr_t seen_objs[20] = {0};  /* 去重：同一个对象只记录一次 */
 
     /* 扫描所有rw区域找PlayerState对象 */
+    uint8_t fpsbuf[4096];
     for (int seg = 0; seg < g_all_rw_count && player_count < 20; seg++) {
-        uintptr_t* ptr = (uintptr_t*)g_all_rw[seg][0];
-        size_t count = (g_all_rw[seg][1] - g_all_rw[seg][0]) / sizeof(uintptr_t);
+        uintptr_t scan_start = g_all_rw[seg][0];
+        uintptr_t scan_end = g_all_rw[seg][1];
+
+        for (uintptr_t page = scan_start; page < scan_end; page += 4096) {
+        size_t chunk = (scan_end - page) < 4096 ? (scan_end - page) : 4096;
+        if (bulk_read(page, fpsbuf, chunk) != chunk) continue;
+        uintptr_t* ptr = (uintptr_t*)fpsbuf;
+        size_t count = chunk / sizeof(uintptr_t);
 
         for (size_t i = 0; i < count && player_count < 20; i++) {
             uintptr_t val = ptr[i];
@@ -2406,6 +2490,7 @@ static void api_find_players(int fd, const char* req) {
 
             palhook_log("  player '%s': state=0x%lx inv=0x%lx ctrl=0x%lx",
                 obj_name, val, inv_addr, ctrl_addr);
+            }
         }
     }
 
@@ -2518,8 +2603,13 @@ static uintptr_t resolve_ctrl(const char* body) {
     uintptr_t segs[MAX_RW_REGIONS][2];
     int seg_count = snapshot_rw(segs, MAX_RW_REGIONS);
     for (int seg = 0; seg < seg_count; seg++) {
-        uintptr_t* ptr = (uintptr_t*)segs[seg][0];
-        size_t cnt = (segs[seg][1] - segs[seg][0]) / sizeof(uintptr_t);
+        {
+            uint8_t buf[4096];
+            for (uintptr_t page = segs[seg][0]; page < segs[seg][1]; page += 4096) {
+                size_t chunk = (segs[seg][1] - page) < 4096 ? (segs[seg][1] - page) : 4096;
+                if (bulk_read(page, buf, chunk) != chunk) continue; /* 页面已unmap, 跳过 */
+                uintptr_t* ptr = (uintptr_t*)buf;
+                size_t cnt = chunk / sizeof(uintptr_t);
         for (size_t i = 0; i < cnt; i++) {
             uintptr_t val = ptr[i];
             if (val < 0x10000 || val > 0x800000000000UL) continue;
@@ -2537,6 +2627,8 @@ static uintptr_t resolve_ctrl(const char* body) {
                 char nm[64] = {0};
                 resolve_fname((int)(on & 0xFFFFFFFF), nm, sizeof(nm));
                 if (strncmp(nm, "Default__", 9) != 0) return val;
+            }
+        }
             }
         }
     }
@@ -2611,8 +2703,13 @@ static uintptr_t find_player_character(void) {
         int fi = find_fname_index(classes[c]);
         if (fi <= 0) continue;
         for (int seg = 0; seg < seg_count; seg++) {
-            uintptr_t* ptr = (uintptr_t*)segs[seg][0];
-            size_t cnt = (segs[seg][1] - segs[seg][0]) / sizeof(uintptr_t);
+        {
+            uint8_t buf[4096];
+            for (uintptr_t page = segs[seg][0]; page < segs[seg][1]; page += 4096) {
+                size_t chunk = (segs[seg][1] - page) < 4096 ? (segs[seg][1] - page) : 4096;
+                if (bulk_read(page, buf, chunk) != chunk) continue; /* 页面已unmap, 跳过 */
+                uintptr_t* ptr = (uintptr_t*)buf;
+                size_t cnt = chunk / sizeof(uintptr_t);
             for (size_t i = 0; i < cnt; i++) {
                 uintptr_t val = ptr[i];
                 if (val < 0x10000 || val > 0x800000000000UL) continue;
@@ -2642,7 +2739,9 @@ static uintptr_t find_player_character(void) {
                     }
                 }
             }
+            }
         }
+    }
     }
     return 0;
 }
@@ -2971,8 +3070,13 @@ static void api_set_tech_points(int fd, const char* req) {
     if (ps_fname <= 0) { json_err(fd, 404, "PlayerState class not found"); return; }
 
     for (int seg = 0; seg < g_all_rw_count && !ps; seg++) {
-        uintptr_t* ptr = (uintptr_t*)g_all_rw[seg][0];
-        size_t cnt = (g_all_rw[seg][1] - g_all_rw[seg][0]) / sizeof(uintptr_t);
+        {
+            uint8_t buf[4096];
+            for (uintptr_t page = g_all_rw[seg][0]; page < g_all_rw[seg][1]; page += 4096) {
+                size_t chunk = (g_all_rw[seg][1] - page) < 4096 ? (g_all_rw[seg][1] - page) : 4096;
+                if (bulk_read(page, buf, chunk) != chunk) continue; /* 页面已unmap, 跳过 */
+                uintptr_t* ptr = (uintptr_t*)buf;
+                size_t cnt = chunk / sizeof(uintptr_t);
         for (size_t i = 0; i < cnt; i++) {
             uintptr_t val = ptr[i];
             if (val < 0x10000 || val > 0x800000000000UL) continue;
@@ -2986,6 +3090,8 @@ static void api_set_tech_points(int fd, const char* req) {
             char nm[64] = {0};
             resolve_fname((int)(on & 0xFFFFFFFF), nm, sizeof(nm));
             if (strncmp(nm, "Default__", 9) != 0) { ps = val; break; }
+        }
+            }
         }
     }
     if (!ps) { json_err(fd, 404, "no player online"); return; }
@@ -3058,8 +3164,13 @@ static void api_give_exp_v2(int fd, const char* req) {
 
     uintptr_t pal_util_cdo = 0;
     for (int seg = 0; seg < g_all_rw_count && !pal_util_cdo; seg++) {
-        uintptr_t* ptr = (uintptr_t*)g_all_rw[seg][0];
-        size_t cnt = (g_all_rw[seg][1] - g_all_rw[seg][0]) / sizeof(uintptr_t);
+        {
+            uint8_t buf[4096];
+            for (uintptr_t page = g_all_rw[seg][0]; page < g_all_rw[seg][1]; page += 4096) {
+                size_t chunk = (g_all_rw[seg][1] - page) < 4096 ? (g_all_rw[seg][1] - page) : 4096;
+                if (bulk_read(page, buf, chunk) != chunk) continue; /* 页面已unmap, 跳过 */
+                uintptr_t* ptr = (uintptr_t*)buf;
+                size_t cnt = chunk / sizeof(uintptr_t);
         for (size_t i = 0; i < cnt; i++) {
             uintptr_t val = ptr[i];
             if (val < 0x10000 || val > 0x800000000000UL) continue;
@@ -3071,6 +3182,8 @@ static void api_give_exp_v2(int fd, const char* req) {
             /* 找到PalUtility实例/CDO */
             pal_util_cdo = val;
             break;
+        }
+            }
         }
     }
 
@@ -3283,8 +3396,13 @@ static int collect_objects_by_class(const char* class_name, uintptr_t* out, int 
     uintptr_t segs[MAX_RW_REGIONS][2];
     int seg_count = snapshot_rw(segs, MAX_RW_REGIONS);
     for (int seg = 0; seg < seg_count; seg++) {
-        uintptr_t* ptr = (uintptr_t*)segs[seg][0];
-        size_t cnt = (segs[seg][1] - segs[seg][0]) / sizeof(uintptr_t);
+        {
+            uint8_t buf[4096];
+            for (uintptr_t page = segs[seg][0]; page < segs[seg][1] && n < max_n; page += 4096) {
+                size_t chunk = (segs[seg][1] - page) < 4096 ? (segs[seg][1] - page) : 4096;
+                if (bulk_read(page, buf, chunk) != chunk) continue; /* 页面已unmap, 跳过 */
+                uintptr_t* ptr = (uintptr_t*)buf;
+                size_t cnt = chunk / sizeof(uintptr_t);
         for (size_t i = 0; i < cnt && n < max_n; i++) {
             uintptr_t val = ptr[i];
             if (val < 0x10000 || val > 0x800000000000UL) continue;
@@ -3300,6 +3418,8 @@ static int collect_objects_by_class(const char* class_name, uintptr_t* out, int 
             int dup = 0;
             for (int k = 0; k < n; k++) if (out[k] == val) { dup = 1; break; }
             if (!dup) out[n++] = val;
+        }
+            }
         }
     }
     return n;
@@ -4608,8 +4728,10 @@ static int read_fstring(uintptr_t fstr_addr, char* out, int out_size) {
     int num = (int)(num_raw & 0xFFFFFFFF);
     if (num <= 0 || num > 4096) return -1;
     if (!region_contains(data) || !region_contains(data + (uintptr_t)num * 2)) return -1;
-    /* 直接读UTF-16并转UTF-8 (数据已在区域内) */
-    return utf16_to_utf8((const uint16_t*)data, num, out, out_size);
+    /* 经bulk_read拷入本地缓冲再转UTF-8 (避免region快照与unmap竞态) */
+    uint16_t wbuf[4100];
+    if (bulk_read(data, (uint8_t*)wbuf, (size_t)num * 2) != (size_t)num * 2) return -1;
+    return utf16_to_utf8(wbuf, num, out, out_size);
 }
 
 /* UTF-8字符串转UTF-16LE (UE FString内部编码), 返回字符数 */
@@ -4796,8 +4918,13 @@ static int collect_all_players_scan(void) {
         int fi = find_fname_index(classes[c]);
         if (fi <= 0) continue;
         for (int seg = 0; seg < seg_count && g_players_count < MAX_PLAYER_CACHE; seg++) {
-            uintptr_t* ptr = (uintptr_t*)segs[seg][0];
-            size_t cnt = (segs[seg][1] - segs[seg][0]) / sizeof(uintptr_t);
+        {
+            uint8_t buf[4096];
+            for (uintptr_t page = segs[seg][0]; page < segs[seg][1] && g_players_count < MAX_PLAYER_CACHE; page += 4096) {
+                size_t chunk = (segs[seg][1] - page) < 4096 ? (segs[seg][1] - page) : 4096;
+                if (bulk_read(page, buf, chunk) != chunk) continue; /* 页面已unmap, 跳过 */
+                uintptr_t* ptr = (uintptr_t*)buf;
+                size_t cnt = chunk / sizeof(uintptr_t);
             for (size_t i = 0; i < cnt && g_players_count < MAX_PLAYER_CACHE; i++) {
                 uintptr_t val = ptr[i];
                 if (val < 0x10000 || val > 0x800000000000UL) continue;
@@ -4867,7 +4994,9 @@ static int collect_all_players_scan(void) {
                 g_players[g_players_count].controller = ctrl;
                 g_players_count++;
             }
+            }
         }
+    }
     }
     g_players_ts = time(NULL);
     return g_players_count;
@@ -4926,8 +5055,13 @@ static void collect_player_accounts_scan(void) {
     uintptr_t segs[MAX_RW_REGIONS][2];
     int seg_count = snapshot_rw(segs, MAX_RW_REGIONS);
     for (int seg = 0; seg < seg_count && g_acc_count < MAX_ACC_CACHE; seg++) {
-        uintptr_t* ptr = (uintptr_t*)segs[seg][0];
-        size_t cnt = (segs[seg][1] - segs[seg][0]) / sizeof(uintptr_t);
+        {
+            uint8_t buf[4096];
+            for (uintptr_t page = segs[seg][0]; page < segs[seg][1] && g_acc_count < MAX_ACC_CACHE; page += 4096) {
+                size_t chunk = (segs[seg][1] - page) < 4096 ? (segs[seg][1] - page) : 4096;
+                if (bulk_read(page, buf, chunk) != chunk) continue; /* 页面已unmap, 跳过 */
+                uintptr_t* ptr = (uintptr_t*)buf;
+                size_t cnt = chunk / sizeof(uintptr_t);
         for (size_t i = 0; i < cnt && g_acc_count < MAX_ACC_CACHE; i++) {
             uintptr_t val = ptr[i];
             if (val < 0x10000 || val > 0x800000000000UL) continue;
@@ -4960,6 +5094,8 @@ static void collect_player_accounts_scan(void) {
             snprintf(g_acc_uid[g_acc_count], 64, "%s", uid);
             snprintf(g_acc_platform[g_acc_count], 32, "%s", pname);
             g_acc_count++;
+        }
+            }
         }
     }
     g_acc_ts = time(NULL);
@@ -5051,22 +5187,22 @@ static void fill_player_details(void) {
                     if (nco >= 0 && nc > 0x10000 && region_contains(nc)) {
                         int found = 0;
                         /* 1. 对象本体前2KB (先验证整段在区域内!) */
-                        int can_inline = region_contains(nc) && region_contains(nc + 2047 + 40);
-                        if (can_inline) {
+                        uint8_t ncbuf[2112];
+                        if (bulk_read(nc, ncbuf, sizeof(ncbuf)) == sizeof(ncbuf)) {
                             for (int boff = 0; boff < 2040 && !found; boff += 2) {
                                 char tmp[64] = {0};
-                                if (match_ipv4_wide((uint8_t*)nc, boff, 2080, tmp, sizeof(tmp))) {
+                                if (match_ipv4_wide(ncbuf, boff, 2080, tmp, sizeof(tmp))) {
                                     snprintf(e->ip, sizeof(e->ip), "%s", tmp);
                                     found = 1;
                                 }
                             }
                             for (int boff = 0; boff < 2048 && !found; boff++) {
-                                uint8_t b0 = *(uint8_t*)(nc + boff);
+                                uint8_t b0 = ncbuf[boff];
                                 if (!(b0 >= '0' && b0 <= '9')) continue;
                                 char tmp[64] = {0};
                                 int tl = 0, dots = 0, ok = 1;
                                 for (int k = 0; k < 40 && tl < 60; k++) {
-                                    uint8_t bc = *(uint8_t*)(nc + boff + k);
+                                    uint8_t bc = ncbuf[boff + k];
                                     if (bc >= '0' && bc <= '9') { tmp[tl++] = (char)bc; }
                                     else if (bc == '.' && dots < 3) { tmp[tl++] = '.'; dots++; }
                                     else if (bc == ':' || bc == 0 || bc < 0x20) { break; }
@@ -5079,25 +5215,29 @@ static void fill_player_details(void) {
                             }
                         }
                         /* 2. 跟随对象内指针找 */
+                        uint8_t ncpbuf[512];
+                        size_t ncpread = bulk_read(nc, ncpbuf, sizeof(ncpbuf));
                         for (int poff = 0; poff < 512 && !found; poff += 8) {
+                            if ((size_t)(poff + 8) > ncpread) break;
                             uintptr_t cand = 0;
-                            memcpy(&cand, (void*)(nc + poff), 8);
+                            memcpy(&cand, ncpbuf + poff, 8);
                             if (cand < 0x10000 || cand > 0x800000000000UL) continue;
-                            if (!region_contains(cand) || !region_contains(cand + 63 + 40)) continue;
+                            uint8_t cbuf[128];
+                            if (bulk_read(cand, cbuf, sizeof(cbuf)) != sizeof(cbuf)) continue;
                             for (int boff = 0; boff < 60 && !found; boff += 2) {
                                 char tmp[64] = {0};
-                                if (match_ipv4_wide((uint8_t*)cand, boff, 96, tmp, sizeof(tmp))) {
+                                if (match_ipv4_wide(cbuf, boff, 96, tmp, sizeof(tmp))) {
                                     snprintf(e->ip, sizeof(e->ip), "%s", tmp);
                                     found = 1;
                                 }
                             }
                             for (int boff = 0; boff < 64 && !found; boff++) {
-                                uint8_t b0 = *(uint8_t*)(cand + boff);
+                                uint8_t b0 = cbuf[boff];
                                 if (!(b0 >= '0' && b0 <= '9')) continue;
                                 char tmp[64] = {0};
                                 int tl = 0, dots = 0, ok = 1;
                                 for (int k = 0; k < 40 && tl < 60; k++) {
-                                    uint8_t bc = *(uint8_t*)(cand + boff + k);
+                                    uint8_t bc = cbuf[boff + k];
                                     if (bc >= '0' && bc <= '9') { tmp[tl++] = (char)bc; }
                                     else if (bc == '.' && dots < 3) { tmp[tl++] = '.'; dots++; }
                                     else if (bc == ':' || bc == 0 || bc < 0x20) { break; }
@@ -5182,8 +5322,13 @@ static uintptr_t find_gamestate(void) {
         int fi = find_fname_index(gs_classes[c]);
         if (fi <= 0) continue;
         for (int seg = 0; seg < seg_count && !gs; seg++) {
-            uintptr_t* ptr = (uintptr_t*)segs[seg][0];
-            size_t cnt = (segs[seg][1] - segs[seg][0]) / sizeof(uintptr_t);
+        {
+            uint8_t buf[4096];
+            for (uintptr_t page = segs[seg][0]; page < segs[seg][1] && !gs; page += 4096) {
+                size_t chunk = (segs[seg][1] - page) < 4096 ? (segs[seg][1] - page) : 4096;
+                if (bulk_read(page, buf, chunk) != chunk) continue; /* 页面已unmap, 跳过 */
+                uintptr_t* ptr = (uintptr_t*)buf;
+                size_t cnt = chunk / sizeof(uintptr_t);
             for (size_t i = 0; i < cnt && !gs; i++) {
                 uintptr_t val = ptr[i];
                 if (val < 0x10000 || val > 0x800000000000UL) continue;
@@ -5197,6 +5342,8 @@ static uintptr_t find_gamestate(void) {
                 if (safe_read_ptr(uc + 0x18, &fn) != 0) continue;
                 if ((int)(fn & 0xFFFFFFFF) == fi && obj_belongs_to_world(val)) { gs = val; }
             }
+            }
+        }
         }
     }
     return gs;
@@ -5729,8 +5876,13 @@ static int collect_guild_objects(uintptr_t* out, int max_n) {
     uintptr_t segs[MAX_RW_REGIONS][2];
     int seg_count = snapshot_rw(segs, MAX_RW_REGIONS);
     for (int seg = 0; seg < seg_count && n < max_n; seg++) {
-        uintptr_t* ptr = (uintptr_t*)segs[seg][0];
-        size_t cnt = (segs[seg][1] - segs[seg][0]) / sizeof(uintptr_t);
+        {
+            uint8_t buf[4096];
+            for (uintptr_t page = segs[seg][0]; page < segs[seg][1] && n < max_n; page += 4096) {
+                size_t chunk = (segs[seg][1] - page) < 4096 ? (segs[seg][1] - page) : 4096;
+                if (bulk_read(page, buf, chunk) != chunk) continue; /* 页面已unmap, 跳过 */
+                uintptr_t* ptr = (uintptr_t*)buf;
+                size_t cnt = chunk / sizeof(uintptr_t);
         for (size_t i = 0; i < cnt && n < max_n; i++) {
             uintptr_t val = ptr[i];
             if (val < 0x10000 || val > 0x800000000000UL) continue;
@@ -5759,6 +5911,8 @@ static int collect_guild_objects(uintptr_t* out, int max_n) {
                 for (int k = 0; k < n; k++) if (out[k] == val) { dup = 1; break; }
                 if (!dup) out[n++] = val;
             }
+            }
+        }
         }
     return n;
 }
