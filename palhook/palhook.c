@@ -175,7 +175,8 @@ static int region_contains(uintptr_t addr) {
  * region_contains 保留作为廉价预筛, 挡掉绝大多数明显无效的地址, 避免每次都进内核。 */
 static int safe_read_ptr(uintptr_t addr, uintptr_t* out) {
     if (addr < 0x10000) return -1;
-    if (addr & 7) return -1; /* 指针必然8字节对齐, 未对齐的直接判无效 */
+    /* 注意: 不能要求8字节对齐 —— FName表条目从entry+2读(2字节对齐),
+     * UPROPERTY偏移也可能是任意值, process_vm_readv本身就支持非对齐地址 */
     if (!region_contains(addr) || !region_contains(addr + 7)) return -1;
 
     uintptr_t tmp = 0;
