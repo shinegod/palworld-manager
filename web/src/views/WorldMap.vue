@@ -77,10 +77,11 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted } from 'vue'
 import 'leaflet/dist/leaflet.css'
 import { LMap, LTileLayer, LMarker, LIcon, LTooltip } from '@vue-leaflet/vue-leaflet'
 import http from '@/api'
+import { usePolling } from '@/composables/usePolling'
 
 const LANDSCAPE = [349400, 724400, -1099400, -724400]
 
@@ -160,17 +161,11 @@ async function loadPOI() {
   } catch { /* POI not available */ }
 }
 
-let timer: ReturnType<typeof setInterval> | null = null
-
 onMounted(() => {
-  fetchPlayers()
   loadPOI()
-  timer = setInterval(fetchPlayers, 20000)
 })
 
-onUnmounted(() => {
-  if (timer) clearInterval(timer)
-})
+usePolling(fetchPlayers, 20000)
 </script>
 
 <style scoped>

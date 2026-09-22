@@ -53,18 +53,12 @@ export interface RealtimeMetrics {
   basecampnum: number
 }
 
+// hook-only: 字段以 PalHook /players 实际返回为准
 export interface OnlinePlayer {
   name: string
   playerId: string
-  odss_id: string
-  odss_token: string
   level: number
-  hp: number
-  maxHp: number
-  shieldHp: number
-  maxShieldHp: number
   exp: number
-  statusFlags: string[]
   ip: string
   ping: number
   location_x: number
@@ -81,10 +75,7 @@ export interface ServerInfo {
   version: string
   servername: string
   description: string
-  worldguid: string
 }
-
-
 
 export interface Alert {
   id: number
@@ -107,36 +98,6 @@ export const dashboardApi = {
 export const serverApi = {
   settings: () => http.get<Record<string, unknown>>('/server/settings'),
 }
-
-// ── Players ──
-
-export interface PlayerHistoryItem {
-  playerId: string
-  name: string
-  level: number
-  lastLogin: string
-  lastLogout: string
-  totalOnlineTime: number
-}
-
-export const playerApi = {
-  online: () => http.get<OnlinePlayer[]>('/players/online'),
-  history: (limit: number, offset: number) =>
-    http.get<PlayerHistoryItem[]>('/players/history', { params: { limit, offset } }),
-  kick: (userId: string, message: string) =>
-    http.post('/players/kick', { userId, message }),
-  ban: (userId: string, message: string) =>
-    http.post('/players/ban', { userId, message }),
-  unban: (userId: string) => http.post('/players/unban', { userId }),
-}
-
-// ── Console ──
-
-
-
-// ── Map ──
-
-
 
 // ── Events ──
 

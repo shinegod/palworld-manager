@@ -142,13 +142,51 @@ func (h *PalHookPlayersHandler) GetOnlinePlayers(c *gin.Context) {
 	c.JSON(http.StatusOK, out)
 }
 
-func (h *PalHookPlayersHandler) KickPlayer(c *gin.Context) {
-	var req struct {
-		Name string `json:"name"`
+// playerActionReq 踢出/封禁共用入参。PalHook 只能按名字操作, 前端主要传 userid,
+// 所以 userid 需要回查在线列表换成名字。
+type playerActionReq struct {
+	UserID  string `json:"userid"`
+	Name    string `json:"name"`
+	Message string `json:"message"`
+}
+
+// resolveName 补齐名字: 前端只给 userid 时, 从 PalHook 在线列表反查
+func (h *PalHookPlayersHandler) resolveName(req *playerActionReq) {
+	if req.Name != "" || req.UserID == "" {
+		return
 	}
+	players, err := h.fetchHookPlayers()
+	if err != nil {
+		return
+	}
+	for _, p := range players {
+		if p.Uid == req.UserID {
+			req.Name = p.Name
+			return
+		}
+	}
+}
+
+// operator 取当前登录管理员名, 避免裸类型断言 panic
+func operator(c *gin.Context) string {
+	if v, ok := c.Get("username"); ok {
+		if s, ok := v.(string); ok && s != "" {
+			return s
+		}
+	}
+	return "unknown"
+}
+
+func (h *PalHookPlayersHandler) KickPlayer(c *gin.Context) {
+	var req playerActionReq
 	_ = c.ShouldBindJSON(&req)
+	if req.Name == "" && req.UserID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name or userid is required"})
+		return
+	}
+	h.resolveName(&req)
 	if req.Name == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "玩家不在线或未找到, 无法踢出"})
 		return
 	}
 	if err := h.kickByName(req.Name); err != nil {
@@ -159,25 +197,27 @@ func (h *PalHookPlayersHandler) KickPlayer(c *gin.Context) {
 }
 
 func (h *PalHookPlayersHandler) BanPlayer(c *gin.Context) {
-	var req struct {
-		UserID  string `json:"userid"`
-		Name    string `json:"name"`
-		Message string `json:"message"`
-	}
+	var req playerActionReq
 	_ = c.ShouldBindJSON(&req)
 	if req.Name == "" && req.UserID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name or userid is required"})
 		return
 	}
-	// 踢出 + 本地封禁记录
+	h.resolveName(&req)
+
+	// 在线就踢出; 离线玩家只记封禁 (不算失败)
+	kicked := false
 	if req.Name != "" {
-		_ = h.kickByName(req.Name)
+		kicked = h.kickByName(req.Name) == nil
 	}
-	username, _ := c.Get("username")
 	if h.banStore != nil {
-		_ = h.banStore.Insert(req.UserID, req.Name, req.Message, username.(string))
+		_ = h.banStore.Insert(req.UserID, req.Name, req.Message, operator(c))
 	}
-	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	// 历史库同步标记, 让玩家列表能看出封禁状态
+	if h.playerStore != nil && req.UserID != "" {
+		_ = h.playerStore.MarkBanned(req.UserID, req.Message)
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "kicked": kicked})
 }
 
 func (h *PalHookPlayersHandler) GetBans(c *gin.Context) {
@@ -200,6 +240,9 @@ func (h *PalHookPlayersHandler) UnbanPlayer(c *gin.Context) {
 	}
 	if h.banStore != nil {
 		_ = h.banStore.MarkUnbanned(req.UserID)
+	}
+	if h.playerStore != nil {
+		_ = h.playerStore.MarkUnbanned(req.UserID)
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }

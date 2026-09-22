@@ -285,11 +285,12 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import { Search, ArrowDown } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import http from '@/api'
 import { loadItems, loadPals, type GameItem, type GamePal } from '@/composables/useGameData'
+import { usePolling } from '@/composables/usePolling'
 
 interface OnlinePlayer {
   name: string
@@ -384,8 +385,6 @@ function openTpDialog(player: OnlinePlayer) {
   tpVisible.value = true
   refreshOnline()
 }
-
-let refreshTimer: ReturnType<typeof setInterval> | null = null
 
 const filteredOnline = computed(() => {
   const q = onlineSearch.value.toLowerCase()
@@ -772,15 +771,11 @@ function refreshOnline() {
 }
 
 onMounted(() => {
-  fetchOnline()
   fetchHistory()
   fetchBans()
-  refreshTimer = setInterval(fetchOnline, 10000)
 })
 
-onUnmounted(() => {
-  if (refreshTimer) clearInterval(refreshTimer)
-})
+usePolling(fetchOnline, 10000)
 </script>
 
 <style scoped>

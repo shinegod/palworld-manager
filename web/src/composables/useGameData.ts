@@ -19,22 +19,21 @@ export async function loadItems(): Promise<GameItem[]> {
   const data = await fetch('/data/items.json').then((r) => r.json())
   const enMap = new Map<string, string>()
   for (const it of data.en ?? []) enMap.set(it.key || it.id, it.name)
-  itemsCache = []
+
+  // 用 Map 建索引: 2466 项物品, 原先靠 Array.find 去重是 O(n²)
+  const byKey = new Map<string, GameItem>()
   for (const it of data.zh ?? []) {
     const key = it.key || it.id
-    itemsCache.push({
-      key,
-      nameZh: it.name || key,
-      nameEn: enMap.get(key) || key,
-    })
+    byKey.set(key, { key, nameZh: it.name || key, nameEn: enMap.get(key) || key })
   }
   // 补齐只有英文没有中文的
   for (const it of data.en ?? []) {
     const key = it.key || it.id
-    if (!itemsCache.find((i) => i.key === key)) {
-      itemsCache.push({ key, nameZh: it.name || key, nameEn: it.name || key })
+    if (!byKey.has(key)) {
+      byKey.set(key, { key, nameZh: it.name || key, nameEn: it.name || key })
     }
   }
+  itemsCache = [...byKey.values()]
   return itemsCache
 }
 

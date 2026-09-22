@@ -29,7 +29,7 @@
 #include <sys/syscall.h>
 
 #define PALHOOK_PORT 13335
-#define PALHOOK_VERSION "0.9.14"
+#define PALHOOK_VERSION "0.9.15"
 #define MAX_REQUEST 16384
 #define MAX_RESPONSE 262144
 #define LOG_PREFIX "[PalHook] "
@@ -470,6 +470,30 @@ static int base64_decode(const char* in, int in_len, char* out, int out_max) {
 }
 
 /* 检查HTTP Basic Auth, 返回0=通过, -1=失败 */
+/* 定长比较: 不因首个不同字节就短路, 避免泄漏密码前缀 */
+static int pwd_equal(const char* a, const char* b) {
+    size_t la = strlen(a), lb = strlen(b);
+    unsigned char diff = (la == lb) ? 0 : 1;
+    size_t n = la < lb ? la : lb;
+    for (size_t i = 0; i < n; i++) diff |= (unsigned char)(a[i] ^ b[i]);
+    return diff == 0;
+}
+
+/* 裸内存原语: 无密码时绝不开放 (任意读写=进程RCE) */
+static int is_dangerous_path(const char* path) {
+    static const char* deny[] = {
+        "/writemem", "/readmem", "/call-function", "/cheat",
+        "/search-bytes", "/find-value", "/scan",
+        "/maps", "/meminfo", "/find-class", "/find-vtable",
+        "/find-players", "/dump-guilds", "/get-npc-manager", NULL
+    };
+    for (int i = 0; deny[i]; i++) {
+        size_t n = strlen(deny[i]);
+        if (strncmp(path, deny[i], n) == 0 && (path[n] == 0 || path[n] == '?')) return 1;
+    }
+    return 0;
+}
+
 static int check_auth(int fd, const char* req) {
     /* 懒重试: 密码还没找到时(游戏刚启动), 隔几秒重扫一次 */
     static time_t g_pw_retry_ts = 0;
@@ -477,19 +501,31 @@ static int check_auth(int fd, const char* req) {
         g_pw_retry_ts = time(NULL);
         load_admin_password();
     }
-    if (!g_admin_password[0]) return 0; /* 无密码=不检查 */
 
-    /* /health不需要认证 */
     char path[64] = {0};
     sscanf(req, "%*s %63s", path);
+
+    /* /health不需要认证 */
     if (strcmp(path, "/health") == 0 || strcmp(path, "/") == 0) return 0;
+
+    if (!g_admin_password[0]) {
+        /* 无密码: 普通接口放行(兼容未设AdminPassword的服务器), 但内存原语一律拒绝 */
+        if (is_dangerous_path(path)) {
+            const char* resp = "HTTP/1.1 403 Forbidden\r\n"
+                "Content-Length: 58\r\n\r\n"
+                "{\"error\":\"memory endpoints need AdminPassword to be set\"}\r\n";
+            send(fd, resp, strlen(resp), MSG_NOSIGNAL);
+            return -1;
+        }
+        return 0;
+    }
 
     const char* auth = strstr(req, "Authorization: Basic ");
     if (!auth) {
         const char* resp = "HTTP/1.1 401 Unauthorized\r\n"
             "WWW-Authenticate: Basic realm=\"PalHook\"\r\n"
             "Content-Length: 14\r\n\r\nUnauthorized\r\n";
-        send(fd, resp, strlen(resp), 0);
+        send(fd, resp, strlen(resp), MSG_NOSIGNAL);
         return -1;
     }
     auth += 21;
@@ -507,10 +543,10 @@ static int check_auth(int fd, const char* req) {
     char* colon = strchr(decoded, ':');
     const char* pwd = colon ? colon + 1 : decoded;
 
-    if (strcmp(pwd, g_admin_password) != 0) {
+    if (!pwd_equal(pwd, g_admin_password)) {
         const char* resp = "HTTP/1.1 401 Unauthorized\r\n"
             "Content-Length: 14\r\n\r\nUnauthorized\r\n";
-        send(fd, resp, strlen(resp), 0);
+        send(fd, resp, strlen(resp), MSG_NOSIGNAL);
         return -1;
     }
     return 0;
@@ -993,8 +1029,8 @@ typedef struct {
     double x, y, z;
 } PlayerEntry;
 static PlayerEntry g_players[MAX_PLAYER_CACHE];
-static int g_players_count;
-static time_t g_players_ts;
+static int g_players_count = 0;
+static time_t g_players_ts = 0;
 static int collect_all_players(void);
 static uintptr_t find_gamestate(void);
 static int get_connected_playerstates(uintptr_t* out, int max_n);
@@ -4610,9 +4646,7 @@ static void build_fstring_at(uint8_t* params, int off, const char* s, uint8_t* s
     *(int32_t*)(params + off + 12) = n + 1;
 }
 
-/* 玩家列表缓存 (定义已上移到全局前置声明区, 这里只做初始化) */
-static int g_players_count = 0;
-static time_t g_players_ts = 0;
+/* 玩家列表缓存 g_players/g_players_count/g_players_ts 已在前置声明区定义 (约第995行) */
 
 /* 从角色拿到PlayerState (APawn::PlayerState属性, off=688实测) */
 static uintptr_t get_pawn_playerstate(uintptr_t character) {
@@ -6077,8 +6111,14 @@ static void api_find_value(int fd, const char* req) {
 /* ========== HTTP路由 ========== */
 
 static void handle_request(int fd) {
-    /* 刷新内存映射 (新mmap的FNamePool块等), 加锁保护 */
-    parse_proc_maps();
+    /* 刷新内存映射 (新mmap的FNamePool块等), 加锁保护。
+       /proc/self/maps 有几百行, 每请求全解析纯属浪费 —— 2秒内复用上次结果。 */
+    static time_t g_maps_ts = 0;
+    time_t now = time(NULL);
+    if (now - g_maps_ts >= 2) {
+        g_maps_ts = now;
+        parse_proc_maps();
+    }
 
     char req[MAX_REQUEST] = {0};
     int n = recv(fd, req, sizeof(req) - 1, 0);

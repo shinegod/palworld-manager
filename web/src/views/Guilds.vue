@@ -116,10 +116,11 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Search, Refresh } from '@element-plus/icons-vue'
 import http from '@/api'
+import { usePolling } from '@/composables/usePolling'
 
 const guilds = ref<any[]>([])
 const loading = ref(false)
@@ -214,16 +215,7 @@ function selectGuild(row: any) {
   detailVisible.value = true
 }
 
-let timer: ReturnType<typeof setInterval> | null = null
-
-onMounted(() => {
-  fetchGuilds()
-  timer = setInterval(fetchGuilds, 120000)
-})
-
-onUnmounted(() => {
-  if (timer) clearInterval(timer)
-})
+usePolling(fetchGuilds, 120000)
 </script>
 
 <style scoped>

@@ -51,38 +51,36 @@ func (h *HookDashboardHandler) GetRealtime(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "PalHook未配置，请在 设置→连接配置 中填写 PalHook 地址"})
 		return
 	}
-	type rtResult struct {
-		metrics map[string]any
-		players []any
-	}
-	var res rtResult
+	// 各 goroutine 只写自己的变量, 避免共享 struct 造成数据竞争
+	var metrics map[string]any
+	var players []any
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		metrics := map[string]any{}
+		m := map[string]any{}
 		mb, code, err := h.hookGet("/metrics")
-		if err != nil || code != http.StatusOK || json.Unmarshal(mb, &metrics) != nil {
-			metrics = map[string]any{}
+		if err != nil || code != http.StatusOK || json.Unmarshal(mb, &m) != nil {
+			m = map[string]any{}
 		}
-		res.metrics = metrics
+		metrics = m
 	}()
 	go func() {
 		defer wg.Done()
-		players := []any{}
+		p := []any{}
 		pb, pcode, _ := h.hookGet("/players")
 		if pcode == http.StatusOK {
 			var pr struct {
 				Players []any `json:"players"`
 			}
 			if json.Unmarshal(pb, &pr) == nil && pr.Players != nil {
-				players = pr.Players
+				p = pr.Players
 			}
 		}
-		res.players = players
+		players = p
 	}()
 	wg.Wait()
-	c.JSON(http.StatusOK, gin.H{"metrics": res.metrics, "players": res.players})
+	c.JSON(http.StatusOK, gin.H{"metrics": metrics, "players": players})
 }
 
 // GetInfo 服务器基本信息 (来自 PalHook /health)
@@ -165,8 +163,11 @@ func (h *HookDashboardHandler) GetPlayerPositions(c *gin.Context) {
 
 // StartHookHistoryRecorder 后台轻量轮询: 把在线玩家快照写入历史库 (60s一次, 只打PalHook)
 func StartHookHistoryRecorder(cs *store.ConfigStore, ps *store.PlayerStore, stop <-chan struct{}) {
-	ticker := time.NewTicker(60 * time.Second)
+	const interval = 60 * time.Second
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	client := &http.Client{Timeout: 30 * time.Second}
+
 	for {
 		select {
 		case <-stop:
@@ -176,9 +177,11 @@ func StartHookHistoryRecorder(cs *store.ConfigStore, ps *store.PlayerStore, stop
 			if cc == nil || cc.PalHookURL == "" {
 				continue
 			}
-			req, _ := http.NewRequest(http.MethodGet, cc.PalHookURL+"/players", nil)
+			req, err := http.NewRequest(http.MethodGet, cc.PalHookURL+"/players", nil)
+			if err != nil {
+				continue
+			}
 			req.SetBasicAuth("admin", cc.PalHookPassword)
-			client := &http.Client{Timeout: 30 * time.Second}
 			resp, err := client.Do(req)
 			if err != nil {
 				continue
@@ -191,6 +194,10 @@ func StartHookHistoryRecorder(cs *store.ConfigStore, ps *store.PlayerStore, stop
 			if json.Unmarshal(body, &pr) != nil {
 				continue
 			}
+
+			// 本轮在线的 uid; 上一轮在线但这轮不在的要标记离线,
+			// 否则历史列表里的人永远显示"在线"
+			nowOnline := make(map[string]bool, len(pr.Players))
 			for _, p := range pr.Players {
 				name, _ := p["name"].(string)
 				uid, _ := p["uid"].(string)
@@ -201,7 +208,20 @@ func StartHookHistoryRecorder(cs *store.ConfigStore, ps *store.PlayerStore, stop
 				if v, ok := p["level"].(float64); ok {
 					lvl = int(v)
 				}
+				nowOnline[uid] = true
 				_ = ps.UpsertPlayerSnapshot(uid, name, lvl)
+				// 在线时长累加: 每轮 +interval
+				_ = ps.AddPlaytime(uid, int64(interval.Seconds()))
+			}
+
+			prevOnline, err := ps.GetOnlineUIDs()
+			if err != nil {
+				continue
+			}
+			for uid := range prevOnline {
+				if !nowOnline[uid] {
+					_ = ps.SetOffline(uid)
+				}
 			}
 		}
 	}

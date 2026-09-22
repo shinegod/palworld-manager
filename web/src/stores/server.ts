@@ -1,11 +1,12 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import {
-  palhookApi,
   http,
   type ServerInfo,
   type RealtimeMetrics,
+  type RealtimeResponse,
   type OnlinePlayer,
+  type PalHookMetrics,
 } from '@/api'
 
 // hook-only: 全部数据来自 PalHook
@@ -23,7 +24,6 @@ export const useServerStore = defineStore('server', () => {
         version: res.data.version ?? '',
         servername: res.data.servername ?? '',
         description: res.data.description ?? '',
-        worldguid: res.data.worldguid ?? '',
       }
     } catch {
       serverInfo.value = null
@@ -34,32 +34,29 @@ export const useServerStore = defineStore('server', () => {
   async function fetchRealtime() {
     try {
       connectionStatus.value = 'connecting'
-      const [m, p] = await Promise.all([palhookApi.metrics(), palhookApi.players()])
-      const md = m.data
+      // 后端 /dashboard/realtime 已并行合并 PalHook 的 /metrics + /players,
+      // 前端只发一个请求, 少一半往返
+      const res = await http.get<RealtimeResponse>('/dashboard/realtime')
+      const md = (res.data?.metrics ?? {}) as Partial<PalHookMetrics> & Partial<RealtimeMetrics>
+      const fps = md.fps ?? md.serverfps ?? 0
+      const uptime = md.uptime_sec ?? md.uptime ?? 0
       realtimeMetrics.value = {
-        serverfps: md.fps ?? 0,
-        currentplayernum: md.player_count ?? 0,
-        serverframetime: md.fps > 0 ? Math.round(1000 / md.fps) : 0,
-        maxplayernum: 32,
-        uptime: md.uptime_sec ?? 0,
-        days: Math.floor((md.uptime_sec ?? 0) / 86400),
-        serverfpsaverage: md.fps ?? 0,
-        basecampnum: 0,
+        serverfps: fps,
+        currentplayernum: md.player_count ?? md.currentplayernum ?? 0,
+        serverframetime: fps > 0 ? Math.round(1000 / fps) : 0,
+        maxplayernum: md.maxplayernum ?? 32,
+        uptime,
+        days: Math.floor(uptime / 86400),
+        serverfpsaverage: fps,
+        basecampnum: md.basecampnum ?? 0,
       }
-      onlinePlayers.value = (p.data?.players ?? []).map((pl: any) => ({
+      onlinePlayers.value = (res.data?.players ?? []).map((pl: any) => ({
         name: pl.name ?? '',
-        playerId: pl.uid ?? '',
-        odss_id: '',
-        odss_token: '',
+        playerId: pl.uid ?? pl.playerId ?? '',
         level: pl.level ?? 0,
-        hp: 0,
-        maxHp: 0,
-        shieldHp: 0,
-        maxShieldHp: 0,
         exp: pl.exp ?? 0,
-        statusFlags: [],
-        ip: '',
-        ping: 0,
+        ip: pl.ip ?? '',
+        ping: pl.ping ?? 0,
         location_x: pl.x ?? 0,
         location_y: pl.y ?? 0,
         location_z: pl.z ?? 0,

@@ -97,10 +97,11 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { ChatDotRound, ChatLineRound } from '@element-plus/icons-vue'
 import { useServerStore } from '@/stores/server'
+import { usePolling } from '@/composables/usePolling'
 import { palhookApi } from '@/api'
 import GaugeCard from '@/components/dashboard/GaugeCard.vue'
 
@@ -170,19 +171,11 @@ async function handleChat() {
   }
 }
 
-let refreshTimer: ReturnType<typeof setInterval> | undefined
-
 onMounted(() => {
   store.fetchInfo()
-  store.fetchRealtime()
-  refreshTimer = setInterval(() => {
-    store.fetchRealtime()
-  }, 20000)
 })
 
-onUnmounted(() => {
-  if (refreshTimer) clearInterval(refreshTimer)
-})
+usePolling(() => store.fetchRealtime(), 20000)
 </script>
 
 <style scoped>

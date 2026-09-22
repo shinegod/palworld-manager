@@ -6,8 +6,9 @@ import (
 )
 
 type Ban struct {
-	ID         int64      `json:"id"`
-	PlayerUID  string     `json:"player_uid"`
+	ID int64 `json:"id"`
+	// user_id: 与前端 BanRecord 字段对齐 (Players.vue 的用户ID列/解封按钮都读这个)
+	PlayerUID  string     `json:"user_id"`
 	PlayerName string     `json:"player_name"`
 	Reason     string     `json:"reason"`
 	BannedBy   string     `json:"banned_by"`
