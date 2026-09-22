@@ -29,7 +29,7 @@
 #include <sys/uio.h>   /* process_vm_readv: 读无效地址返回EFAULT而非触发SIGSEGV */
 
 #define PALHOOK_PORT 13335
-#define PALHOOK_VERSION "0.9.18"
+#define PALHOOK_VERSION "0.9.19"
 #define MAX_REQUEST 16384
 #define MAX_RESPONSE 262144
 #define LOG_PREFIX "[PalHook] "
@@ -213,7 +213,8 @@ static int safe_write_mem(uintptr_t addr, const void* src, size_t len) {
 }
 
 /* 在远程内存中安全搜索字节模式: 逐页经process_vm_readv拷入本地缓冲再memmem,
- * 远程内存全程零裸读, 页被unmap时跳过继续。返回远程绝对地址偏移, 未找到返回-1。
+ * 远程内存全程零裸读, 页被unmap时跳过继续。
+ * 返回相对addr的字节偏移(0~len), 未找到返回-1。调用方自己加基址。
  * needle_len上限64 (够FName/配置模式用) */
 static long safe_memmem_remote(uintptr_t addr, size_t len, const uint8_t* needle, size_t needle_len) {
     if (needle_len == 0 || needle_len > 64 || len < needle_len) return -1;
@@ -229,7 +230,7 @@ static long safe_memmem_remote(uintptr_t addr, size_t len, const uint8_t* needle
         if (hit) {
             long off = (long)(hit - buf) - (long)carry;
             if (off < 0) off = 0; /* 重叠区命中上一轮已返回, 理论到不了这里 */
-            return (long)page + off;
+            return (long)(page - addr) + off;
         }
     }
     return -1;
@@ -1084,6 +1085,10 @@ static uintptr_t resolve_ctrl(const char* body);
 static uintptr_t get_pal_utility(void);
 static int actor_get_location(uintptr_t actor, double* out);
 static uintptr_t find_property_in_struct(uintptr_t ustruct, const char* prop_name);
+static uintptr_t get_pawn_playerstate(uintptr_t character);
+static int ctrl_is_online(uintptr_t ctrl);
+static int character_is_online(uintptr_t character);
+static uintptr_t pick_online_character(void);
 
 /* 玩家列表缓存 (定义在v0.9.0面板接口区, 这里前置声明供teleport用) */
 #define MAX_PLAYER_CACHE 16
@@ -1162,8 +1167,9 @@ static void api_search_bytes(int fd, const char* req) {
             long sb_hit = safe_memmem_remote(scan_start + (size_t)sb_off,
                 seg_size - (size_t)sb_off, pattern, (size_t)pat_len);
             if (sb_hit < 0) break;
-            sb_off = sb_hit + 1;
-            uintptr_t match_addr = scan_start + (size_t)sb_hit;
+            long sb_abs = sb_off + sb_hit;   /* hit相对当前窗口起点, 加回窗口起点才是段内偏移 */
+            sb_off = sb_abs + 1;
+            uintptr_t match_addr = scan_start + (size_t)sb_abs;
             if (found > 0) buf[pos++] = ',';
                 /* 输出匹配地址和后续16字节的hex */
                 pos += snprintf(buf + pos, 65536 - pos,
@@ -1171,7 +1177,7 @@ static void api_search_bytes(int fd, const char* req) {
                 /* 显示上下文字节 */
                 pos += snprintf(buf + pos, 65536 - pos, ",\"context\":\"");
                 uint8_t sb_ctx[32];
-                size_t sb_want = seg_size - (size_t)sb_hit;
+                size_t sb_want = seg_size - (size_t)sb_abs;
                 if (sb_want > 32) sb_want = 32;
                 size_t sb_ctx_read = bulk_read(match_addr, sb_ctx, sb_want);
                 for (size_t j = 0; j < sb_ctx_read && pos < 65000; j++) {
@@ -1912,17 +1918,18 @@ static int find_fname_index(const char* target_name) {
         }
         if (block_size < 64) continue;
 
-        long off = 0;
-        while ((size_t)off + (size_t)target_len + 2 < block_size) {
-            long hit = safe_memmem_remote(block_ptr + (size_t)off, block_size - (size_t)off,
+        long base_off = 0;
+        while ((size_t)base_off + (size_t)target_len + 2 < block_size) {
+            long hit = safe_memmem_remote(block_ptr + (size_t)base_off, block_size - (size_t)base_off,
                 (const uint8_t*)target_name, (size_t)target_len);
             if (hit < 0) break;
-            off = hit + 1;
-            uintptr_t found = block_ptr + (size_t)hit;
+            long abs_off = base_off + hit;   /* hit相对当前窗口起点, 加回窗口起点才是块内偏移 */
+            uintptr_t found = block_ptr + (size_t)abs_off;
+            base_off = abs_off + 1;
 
             /* 验证header: found-2处的uint16, header>>6应该等于target_len */
             uint16_t header = 0;
-            if (hit >= 2 && bulk_read(found - 2, (uint8_t*)&header, 2) == 2) {
+            if (abs_off >= 2 && bulk_read(found - 2, (uint8_t*)&header, 2) == 2) {
                 int hdr_len = header >> 6;
                 int is_wide = header & 1;
 
@@ -1962,15 +1969,16 @@ static int find_fname_index(const char* target_name) {
             }
             if (block_size < 64) continue;
 
-            long off = 0;
-            while ((size_t)off + (size_t)target_len * 2 + 2 < block_size) {
-                long hit = safe_memmem_remote(block_ptr + (size_t)off, block_size - (size_t)off,
+            long base_off = 0;
+            while ((size_t)base_off + (size_t)target_len * 2 + 2 < block_size) {
+                long hit = safe_memmem_remote(block_ptr + (size_t)base_off, block_size - (size_t)base_off,
                     wide_pat, (size_t)target_len * 2);
                 if (hit < 0) break;
-                off = hit + 1;
-                uintptr_t found = block_ptr + (size_t)hit;
+                long abs_off = base_off + hit;
+                uintptr_t found = block_ptr + (size_t)abs_off;
+                base_off = abs_off + 1;
                 uint16_t header = 0;
-                if (hit >= 2 && bulk_read(found - 2, (uint8_t*)&header, 2) == 2) {
+                if (abs_off >= 2 && bulk_read(found - 2, (uint8_t*)&header, 2) == 2) {
                     int hdr_len = header >> 6;
                     int is_wide = header & 1;
                     if (hdr_len == target_len && is_wide) {
@@ -2311,6 +2319,8 @@ static void give_item_impl(int fd, const char* body) {
         fill_player_details();
         for (int i = 0; i < g_players_count && !inv_obj; i++) {
             if (strcmp(g_players[i].name, player_name) == 0 && g_players[i].playerstate) {
+                /* 只对在线玩家调GetInventoryData (断线残影的PlayerState同样会崩游戏) */
+                if (!character_is_online(g_players[i].character)) continue;
                 uintptr_t ps = g_players[i].playerstate;
                 uintptr_t pcls = 0;
                 safe_read_ptr(ps + 0x10, &pcls);
@@ -2342,45 +2352,12 @@ static void give_item_impl(int fd, const char* body) {
         palhook_log("give-item: target player '%s' inv=0x%lx", player_name, inv_obj);
     }
 
-    /* inv没传或无效时，自动查找第一个玩家的InventoryData */
+    /* 全内存扫描自动找背包已废弃 (v0.9.19): 扫描会捡到存档里离线玩家的残影
+     * InventoryData, 对其调AddItem_ServerInternal UE内部必崩 (测试服实测即关服)。
+     * 必须显式传 inv 地址, 或指定在线玩家名走PlayerState::GetInventoryData */
     if (inv_obj < 0x10000) {
-        int inv_fname_idx = find_fname_index("BP_PalPlayerInventoryData_C");
-        if (inv_fname_idx > 0 && g_all_rw_count > 0) {
-            for (int seg = 0; seg < g_all_rw_count && inv_obj == 0; seg++) {
-        {
-            uint8_t buf[4096];
-            for (uintptr_t page = g_all_rw[seg][0]; page < g_all_rw[seg][1]; page += 4096) {
-                size_t chunk = (g_all_rw[seg][1] - page) < 4096 ? (g_all_rw[seg][1] - page) : 4096;
-                if (bulk_read(page, buf, chunk) != chunk) continue; /* 页面已unmap, 跳过 */
-                uintptr_t* ptr = (uintptr_t*)buf;
-                size_t cnt = chunk / sizeof(uintptr_t);
-                for (size_t i = 0; i < cnt; i++) {
-                    uintptr_t val = ptr[i];
-                    if (val < 0x10000 || val > 0x800000000000UL) continue;
-                    uintptr_t uc = 0;
-                    if (safe_read_ptr(val + 0x10, &uc) != 0) continue;
-                    uintptr_t fn = 0;
-                    if (safe_read_ptr(uc + 0x18, &fn) != 0) continue;
-                    if ((int)(fn & 0xFFFFFFFF) == inv_fname_idx) {
-                        uintptr_t on = 0;
-                        safe_read_ptr(val + 0x18, &on);
-                        char nm[64] = {0};
-                        resolve_fname((int)(on & 0xFFFFFFFF), nm, sizeof(nm));
-                        if (strncmp(nm, "Default__", 9) != 0) {
-                            inv_obj = val;
-                            palhook_log("give-item: auto-found inv=0x%lx", inv_obj);
-                            break;
-                        }
-                    }
-                }
-            }
-            }
-        }
-        if (inv_obj == 0) {
-            json_err(fd, 404, "no player InventoryData found, pass 'inv' or ensure a player is online");
-            return;
-        }
-    }
+        json_err(fd, 404, "no online player inventory, pass 'inv' or 'name' of an online player");
+        return;
     }
 
     palhook_log("give-item: item='%s' count=%d inv=0x%lx", item_id, count, inv_obj);
@@ -2675,6 +2652,53 @@ static void api_give_money(int fd, const char* req) {
     give_item_impl(fd, fake);
 }
 
+/* 在线校验辅助 (v0.9.19): 所有ProcessEvent类管理指令的目标都必须是
+ * "当前已连接"玩家。存档里的离线残影角色/控制器对象仍在内存里、vtable也合法,
+ * 但它们的Controller/MovementComponent已被销毁, 对其调Teleport/AddExp等
+ * 函数UE内部直接崩溃 —— 这就是"刷等级/传送即关服"的根因之一 */
+static int ctrl_is_online(uintptr_t ctrl) {
+    uintptr_t ccls = 0;
+    if (safe_read_ptr(ctrl + 0x10, &ccls) != 0 || ccls < 0x10000) return 0;
+    uintptr_t ps_prop = find_property_in_struct(ccls, "PlayerState");
+    if (!ps_prop) return 0;
+    int poff = prop_get_offset(ps_prop);
+    uintptr_t ps = 0;
+    if (poff < 0 || safe_read_ptr(ctrl + poff, &ps) != 0 || ps < 0x10000) return 0;
+    uintptr_t conn[MAX_PLAYER_CACHE];
+    int n = get_connected_playerstates(conn, MAX_PLAYER_CACHE);
+    for (int i = 0; i < n; i++) if (conn[i] == ps) return 1;
+    return 0;
+}
+
+static int character_is_online(uintptr_t character) {
+    uintptr_t myps = get_pawn_playerstate(character);
+    if (!myps) return 0;
+    uintptr_t conn[MAX_PLAYER_CACHE];
+    int n = get_connected_playerstates(conn, MAX_PLAYER_CACHE);
+    for (int i = 0; i < n; i++) if (conn[i] == myps) return 1;
+    return 0;
+}
+
+/* 从GameState的PlayerArray (权威在线列表) 取第一个在线玩家的角色 */
+static uintptr_t pick_online_character(void) {
+    uintptr_t conn[MAX_PLAYER_CACHE];
+    int n = get_connected_playerstates(conn, MAX_PLAYER_CACHE);
+    for (int i = 0; i < n; i++) {
+        uintptr_t ps = conn[i];
+        uintptr_t pcls = 0;
+        if (safe_read_ptr(ps + 0x10, &pcls) != 0 || pcls < 0x10000) continue;
+        uintptr_t pawn_prop = find_property_in_struct(pcls, "PawnPrivate");
+        if (!pawn_prop) continue;
+        int poff = prop_get_offset(pawn_prop);
+        uintptr_t pawn = 0;
+        if (poff < 0 || safe_read_ptr(ps + poff, &pawn) != 0 || pawn < 0x10000) continue;
+        uintptr_t ov = 0;
+        if (safe_read_ptr(pawn, &ov) != 0 || !is_plausible_vtable(ov)) continue;
+        return pawn;
+    }
+    return 0;
+}
+
 /* 通用: 从body中找ctrl，没传就自动查找第一个玩家的Controller */
 static uintptr_t resolve_ctrl(const char* body) {
     char ctrl_str[64] = {0};
@@ -2712,7 +2736,7 @@ static uintptr_t resolve_ctrl(const char* body) {
                 safe_read_ptr(val + 0x18, &on);
                 char nm[64] = {0};
                 resolve_fname((int)(on & 0xFFFFFFFF), nm, sizeof(nm));
-                if (strncmp(nm, "Default__", 9) != 0) return val;
+                if (strncmp(nm, "Default__", 9) != 0 && ctrl_is_online(val)) return val;
             }
         }
             }
@@ -2872,11 +2896,20 @@ static void api_teleport(int fd, const char* req) {
             return;
         }
     } else {
-        character = find_player_character();
+        /* 默认目标必须是"当前在线"玩家: find_player_character扫描可能捡到
+         * 存档里离线玩家的残影角色, 对残影调PalUtility::Teleport UE内部必崩 */
+        character = pick_online_character();
         if (!character) {
-            json_err(fd, 404, "player character not found");
+            json_err(fd, 404, "no player online");
             return;
         }
+    }
+
+    /* 传送前最后确认目标是已连接玩家 (g_players缓存有20s TTL,
+     * 刚断线的玩家可能还在列表里) */
+    if (!character_is_online(character)) {
+        json_err(fd, 404, "player not online, teleport refused");
+        return;
     }
 
     double x = 0, y = 0, z = 0;
@@ -3873,6 +3906,43 @@ static int actor_get_location(uintptr_t actor, double* out) {
     uintptr_t cls = 0;
     if (safe_read_ptr(actor + 0x10, &cls) != 0 || cls == 0) return -1;
 
+    /* 优先内存直读 RootComponent -> RelativeLocation:
+     * 纯读取零ProcessEvent, 对刚断线的残影角色也绝对安全。
+     * (旧代码优先走K2_GetActorLocation的ProcessEvent, 面板每次刷新玩家列表
+     * 都可能在断线瞬间对半销毁的角色调函数 -> 又一个"传送/刷等级即关服"的根因) */
+    uintptr_t rc_prop = find_property_in_struct(cls, "RootComponent");
+    if (rc_prop) {
+        int rc_off = prop_get_offset(rc_prop);
+        uintptr_t root = 0;
+        if (rc_off >= 0 && safe_read_ptr(actor + rc_off, &root) == 0 && root > 0x10000) {
+            uintptr_t rc_cls = 0;
+            if (safe_read_ptr(root + 0x10, &rc_cls) == 0 && rc_cls > 0x10000) {
+                uintptr_t rl_prop = find_property_in_struct(rc_cls, "RelativeLocation");
+                if (rl_prop) {
+                    int rl_off = prop_get_offset(rl_prop);
+                    if (rl_off >= 0 && region_contains(root + rl_off + 16)) {
+                        uintptr_t d0 = 0, d1 = 0, d2 = 0;
+                        if (safe_read_ptr(root + rl_off + 0, &d0) == 0 &&
+                            safe_read_ptr(root + rl_off + 8, &d1) == 0 &&
+                            safe_read_ptr(root + rl_off + 16, &d2) == 0) {
+                            out[0] = *(double*)&d0;
+                            out[1] = *(double*)&d1;
+                            out[2] = *(double*)&d2;
+                            /* 残影对象可能读出NaN/超大值, 直接喂给UE的范围查询会崩 */
+                            if (isfinite(out[0]) && isfinite(out[1]) && isfinite(out[2]) &&
+                                fabs(out[0]) < 1e7 && fabs(out[1]) < 1e7 && fabs(out[2]) < 1e7) {
+                                palhook_log("actor_get_location(mem): root=0x%lx off=0x%x -> (%.1f, %.1f, %.1f)",
+                                    root, rl_off, out[0], out[1], out[2]);
+                                return 0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* 兜底: K2_GetActorLocation (UFunction, 本构建可能不存在) */
     void* ufunc = find_ufunction_in_class(cls, "K2_GetActorLocation");
     if (ufunc) {
         uintptr_t pr = 0;
@@ -3894,33 +3964,7 @@ static int actor_get_location(uintptr_t actor, double* out) {
         free(params);
         return r;
     }
-
-    /* 内存直读: RootComponent -> RelativeLocation */
-    uintptr_t rc_prop = find_property_in_struct(cls, "RootComponent");
-    if (!rc_prop) { palhook_log("actor_get_location: RootComponent property not found"); return -3; }
-    int rc_off = prop_get_offset(rc_prop);
-    if (rc_off < 0) return -4;
-    uintptr_t root = 0;
-    if (safe_read_ptr(actor + rc_off, &root) != 0 || root < 0x10000) return -5;
-
-    uintptr_t rc_cls = 0;
-    if (safe_read_ptr(root + 0x10, &rc_cls) != 0) return -6;
-    uintptr_t rl_prop = find_property_in_struct(rc_cls, "RelativeLocation");
-    if (!rl_prop) { palhook_log("actor_get_location: RelativeLocation property not found"); return -7; }
-    int rl_off = prop_get_offset(rl_prop);
-    if (rl_off < 0) return -8;
-    if (!region_contains(root + rl_off + 16)) return -9;
-
-    uintptr_t d0 = 0, d1 = 0, d2 = 0;
-    if (safe_read_ptr(root + rl_off + 0, &d0) != 0 ||
-        safe_read_ptr(root + rl_off + 8, &d1) != 0 ||
-        safe_read_ptr(root + rl_off + 16, &d2) != 0) return -10;
-    out[0] = *(double*)&d0;
-    out[1] = *(double*)&d1;
-    out[2] = *(double*)&d2;
-    palhook_log("actor_get_location(mem): root=0x%lx off=0x%x -> (%.1f, %.1f, %.1f)",
-        root, rl_off, out[0], out[1], out[2]);
-    return 0;
+    return -3;
 }
 
 /* 调用 PalUtility:GetNPCManager(WorldContextObject) -> UNPCManager* */
@@ -3993,7 +4037,9 @@ static void api_give_exp_v3(int fd, const char* req) {
     char pname[64] = {0};
     json_get_string(body, "name", pname, sizeof(pname));
 
-    /* 1. 玩家Character (指定玩家则用该玩家的角色) */
+    /* 1. 玩家Character (指定玩家则用该玩家的角色; 目标必须是当前在线玩家,
+     * 否则残影角色的坐标/组件是半销毁状态, GiveExpToAroundPlayerCharacter
+     * 用垃圾坐标做范围查询会崩整个游戏) */
     uintptr_t character = 0;
     if (pname[0]) {
         if (g_players_ts == 0 || time(NULL) - g_players_ts > 20) collect_all_players();
@@ -4007,9 +4053,13 @@ static void api_give_exp_v3(int fd, const char* req) {
             json_err(fd, 404, e);
             return;
         }
+        if (!character_is_online(character)) {
+            json_err(fd, 404, "player not online");
+            return;
+        }
     } else {
-        character = find_player_character();
-        if (!character) { json_err(fd, 404, "player character not found"); return; }
+        character = pick_online_character();
+        if (!character) { json_err(fd, 404, "no player online"); return; }
     }
 
     /* 2. 玩家真实坐标 */
@@ -4247,9 +4297,13 @@ static void api_spawn_pal_v2(int fd, const char* req) {
             return;
         }
     } else {
-        character = find_player_character();
+        character = pick_online_character();
     }
-    if (!character) { json_err(fd, 404, "player character not found"); return; }
+    if (!character) { json_err(fd, 404, "no player online"); return; }
+    if (!character_is_online(character)) {
+        json_err(fd, 404, "player not online");
+        return;
+    }
     double loc[3] = {0, 0, 0};
     actor_get_location(character, loc);
     if (has_coords) { loc[0] = x; loc[1] = y; loc[2] = z; }
@@ -4733,9 +4787,14 @@ static void api_set_exp(int fd, const char* req) {
             json_err(fd, 404, e);
             return;
         }
+        if (!character_is_online(character)) {
+            json_err(fd, 404, "player not online");
+            return;
+        }
     } else {
-        character = find_player_character();
-        if (!character) { json_err(fd, 404, "player character not found"); return; }
+        /* 必须在线玩家: 残影角色写等级会写到已回收的IndividualParameter上 */
+        character = pick_online_character();
+        if (!character) { json_err(fd, 404, "no player online"); return; }
     }
 
     uintptr_t cls = 0;
