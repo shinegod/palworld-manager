@@ -22,14 +22,14 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <signal.h>
-#include <setjmp.h>
 #include <time.h>
 #include <math.h>
 #include <sys/types.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>   /* process_vm_readv: 读无效地址返回EFAULT而非触发SIGSEGV */
 
 #define PALHOOK_PORT 13335
-#define PALHOOK_VERSION "0.9.15"
+#define PALHOOK_VERSION "0.9.16"
 #define MAX_REQUEST 16384
 #define MAX_RESPONSE 262144
 #define LOG_PREFIX "[PalHook] "
@@ -164,10 +164,28 @@ static int region_contains(uintptr_t addr) {
     return found;
 }
 
+/* 安全读取任意地址的8字节。
+ *
+ * 为什么不能直接 *(uintptr_t*)addr:
+ * region_contains() 查的是 parse_proc_maps() 的快照, 而 UE 运行中会持续
+ * mmap/munmap。"检查通过" 到 "实际读取" 之间那块内存可能已被 unmap ——
+ * 裸读即 SIGSEGV, 直接带走整个游戏进程 (历史上的 Signal 11 就是这么来的)。
+ *
+ * process_vm_readv 读自己的进程: 地址无效时返回 EFAULT, 不产生信号。
+ * region_contains 保留作为廉价预筛, 挡掉绝大多数明显无效的地址, 避免每次都进内核。 */
 static int safe_read_ptr(uintptr_t addr, uintptr_t* out) {
     if (addr < 0x10000) return -1;
+    if (addr & 7) return -1; /* 指针必然8字节对齐, 未对齐的直接判无效 */
     if (!region_contains(addr) || !region_contains(addr + 7)) return -1;
-    *out = *(volatile uintptr_t*)addr;
+
+    uintptr_t tmp = 0;
+    struct iovec local = { .iov_base = &tmp, .iov_len = sizeof(tmp) };
+    struct iovec remote = { .iov_base = (void*)addr, .iov_len = sizeof(tmp) };
+    if (process_vm_readv(g_init_pid ? g_init_pid : getpid(), &local, 1, &remote, 1, 0)
+            != (ssize_t)sizeof(tmp)) {
+        return -1;
+    }
+    *out = tmp;
     return 0;
 }
 
@@ -180,7 +198,10 @@ static int snapshot_rw(uintptr_t (*dst)[2], int max_n) {
     return n;
 }
 
-/* 保留函数名兼容调用点 (不再安装任何信号处理器) */
+/* 空实现, 仅保留函数名兼容36处历史调用点。
+ * 安全性不再依赖信号处理器: safe_read_ptr 用 process_vm_readv 从根上
+ * 消除了越界读, 无需捕获 SIGSEGV。注入库里装全局 SIGSEGV handler 会干扰
+ * UE 自己的崩溃处理链, 不能这么做。 */
 static void install_segv_handler(void) {
     (void)0;
 }
@@ -5745,16 +5766,17 @@ static int collect_guild_objects(uintptr_t* out, int max_n) {
 static char g_guilds_cache[131072];
 static int g_guilds_cache_len = 0;
 static time_t g_guilds_cache_ts = 0;
+static int g_guilds_last_count = 0;
 static pthread_mutex_t g_guilds_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static pthread_mutex_t g_guilds_scan_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_guilds_refresh_running = 0;
 
 /* 后台刷新: 单趟扫描全部公会类 -> 序列化 -> 写入缓存 (请求永不等待扫描) */
-static void refresh_guilds_cache(void) {
+static void refresh_guilds_cache(int force) {
     if (g_FNamePool == 0 || !g_hook_active) return;
     if (pthread_mutex_trylock(&g_guilds_scan_lock) != 0) return;
-    if (g_guilds_cache_len > 0 && time(NULL) - g_guilds_cache_ts < 60) {
+    if (!force && g_guilds_cache_len > 0 && time(NULL) - g_guilds_cache_ts < 60) {
         pthread_mutex_unlock(&g_guilds_scan_lock);
         return;
     }
@@ -5982,6 +6004,7 @@ static void refresh_guilds_cache(void) {
         memcpy(g_guilds_cache, buf, pos + 1);
         g_guilds_cache_len = pos;
         g_guilds_cache_ts = time(NULL);
+        g_guilds_last_count = out_n;
     }
     pthread_mutex_unlock(&g_guilds_cache_lock);
     pthread_mutex_unlock(&g_guilds_scan_lock);
@@ -5990,7 +6013,7 @@ static void refresh_guilds_cache(void) {
 
 static void* guilds_refresh_thread_fn(void* arg) {
     (void)arg;
-    refresh_guilds_cache();
+    refresh_guilds_cache(0);
     g_guilds_refresh_running = 0;
     return NULL;
 }
@@ -5999,12 +6022,27 @@ static void* guilds_refresh_thread_fn(void* arg) {
 static void api_guilds(int fd, const char* req) {
     (void)req;
     if (g_FNamePool == 0 || !g_hook_active) { json_err(fd, 503, "not ready"); return; }
-    if (g_guilds_cache_len == 0) refresh_guilds_cache();
-    if (g_guilds_cache_len > 0 && time(NULL) - g_guilds_cache_ts >= 60 && !g_guilds_refresh_running) {
-        g_guilds_refresh_running = 1;
-        pthread_t t;
-        if (pthread_create(&t, NULL, guilds_refresh_thread_fn, NULL) == 0) pthread_detach(t);
-        else g_guilds_refresh_running = 0;
+    if (g_guilds_cache_len == 0) refresh_guilds_cache(0);
+    /* 启动早期(3分钟内)缓存可能是在世界加载完之前扫的空结果, 强制重扫一次 */
+    if (g_guilds_cache_len > 0 && g_guilds_last_count == 0 &&
+        time(NULL) - g_start_ts < 180) {
+        refresh_guilds_cache(1);
+    }
+    /* 检查+置位必须原子: 每个HTTP请求跑在独立线程, 裸检查会让多个并发请求
+     * 同时通过, 拉起多个刷新线程同时做全量对象扫描 */
+    if (g_guilds_cache_len > 0 && time(NULL) - g_guilds_cache_ts >= 60) {
+        int should_start = 0;
+        pthread_mutex_lock(&g_guilds_cache_lock);
+        if (!g_guilds_refresh_running) {
+            g_guilds_refresh_running = 1;
+            should_start = 1;
+        }
+        pthread_mutex_unlock(&g_guilds_cache_lock);
+        if (should_start) {
+            pthread_t t;
+            if (pthread_create(&t, NULL, guilds_refresh_thread_fn, NULL) == 0) pthread_detach(t);
+            else g_guilds_refresh_running = 0;
+        }
     }
     char tmp[131072];
     pthread_mutex_lock(&g_guilds_cache_lock);
@@ -6111,11 +6149,17 @@ static void api_find_value(int fd, const char* req) {
 /* ========== HTTP路由 ========== */
 
 static void handle_request(int fd) {
-    /* 刷新内存映射 (新mmap的FNamePool块等), 加锁保护。
-       /proc/self/maps 有几百行, 每请求全解析纯属浪费 —— 2秒内复用上次结果。 */
-    static time_t g_maps_ts = 0;
-    time_t now = time(NULL);
-    if (now - g_maps_ts >= 2) {
+    /* 刷新内存映射 (新mmap的FNamePool块等)。
+       /proc/self/maps 有几百行, 并发请求各解析一遍纯属浪费, 这里做短期合并。
+       TTL 必须短: 快照越旧, region_contains 判断越可能与真实映射脱节。
+       (safe_read_ptr 已用 process_vm_readv 兜底, 过期快照不会再导致崩溃,
+        但仍会让有效地址被误判为无效, 所以取 250ms 这个量级。) */
+    static struct timespec g_maps_ts = {0};
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long elapsed_ms = (now.tv_sec - g_maps_ts.tv_sec) * 1000
+                    + (now.tv_nsec - g_maps_ts.tv_nsec) / 1000000;
+    if (elapsed_ms >= 250) {
         g_maps_ts = now;
         parse_proc_maps();
     }
