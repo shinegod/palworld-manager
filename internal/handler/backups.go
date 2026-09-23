@@ -2,15 +2,15 @@ package handler
 
 import (
 	"archive/zip"
+	"bytes"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
-	"sort"
-	"strings"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -18,13 +18,16 @@ import (
 	"github.com/shinegod/palworld-manager/internal/store"
 )
 
-// BackupHandler 存档备份/恢复/删档。面板与 PalServer 同机 (MCSM) 部署时
-// 可直接读写存档目录; 危险操作 (恢复/删档) 强制要求游戏服务器已停止。
+// BackupHandler 远程存档管理 (面板与游戏服通常不在同一台机器):
+// 备份 = 从 PalHook /saves 拉取所有文件打包成 zip 存在面板本地;
+// 恢复 = 解包本地 zip 逐文件上传到 hook 暂存区, 然后 /saves/apply 应用并重启游戏;
+// 删档 = hook /saves/wipe (删前先在面板侧做一次远程备份), 服务器自动重启为全新存档。
 type BackupHandler struct {
 	db     *sql.DB
 	bs     *store.BackupStore
 	cs     *store.ConfigStore
-	client *http.Client
+	client *http.Client // 短超时 (状态检查)
+	big    *http.Client // 长超时 (大文件传输)
 }
 
 func NewBackupHandler(db *sql.DB, cs *store.ConfigStore) *BackupHandler {
@@ -32,15 +35,9 @@ func NewBackupHandler(db *sql.DB, cs *store.ConfigStore) *BackupHandler {
 		db:     db,
 		bs:     store.NewBackupStore(db),
 		cs:     cs,
-		client: &http.Client{Timeout: 4 * time.Second},
+		client: &http.Client{Timeout: 5 * time.Second},
+		big:    &http.Client{Timeout: 30 * time.Minute},
 	}
-}
-
-func (h *BackupHandler) saveDir() string {
-	if v, ok := h.cs.Get("save_dir"); ok && v != "" {
-		return v
-	}
-	return "/workspace/pal/Pal/Saved/SaveGames"
 }
 
 func (h *BackupHandler) backupDir() string {
@@ -50,29 +47,60 @@ func (h *BackupHandler) backupDir() string {
 	return "data/backups"
 }
 
-// serverOnline 游戏服务器是否在线 (PalHook /health 可达即在线)
-func (h *BackupHandler) serverOnline() bool {
+// hookDo 请求 PalHook, 返回响应体(最多8MB)与状态码
+func (h *BackupHandler) hookDo(method, path string, body io.Reader, clen int64) ([]byte, int, error) {
 	cc := h.cs.GetConnectionConfig()
 	if cc == nil || cc.PalHookURL == "" {
-		return false
+		return nil, 0, fmt.Errorf("PalHook未配置")
 	}
-	req, err := http.NewRequest(http.MethodGet, cc.PalHookURL+"/health", nil)
+	req, err := http.NewRequest(method, cc.PalHookURL+path, body)
 	if err != nil {
-		return false
+		return nil, 0, err
 	}
 	req.SetBasicAuth("admin", cc.PalHookPassword)
-	resp, err := h.client.Do(req)
+	if clen >= 0 {
+		req.ContentLength = clen
+	}
+	client := h.client
+	if body != nil {
+		client = h.big
+	}
+	resp, err := client.Do(req)
 	if err != nil {
-		return false
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
-	return resp.StatusCode == http.StatusOK
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	return data, resp.StatusCode, nil
+}
+
+// serverOnline 游戏服务器是否在线 (PalHook /health 可达即在线)
+func (h *BackupHandler) serverOnline() bool {
+	_, code, err := h.hookDo(http.MethodGet, "/health", nil, -1)
+	return err == nil && code == http.StatusOK
+}
+
+// hookSaves 拉取 hook 的存档文件列表
+func (h *BackupHandler) hookSaves() (string, []map[string]any, error) {
+	data, code, err := h.hookDo(http.MethodGet, "/saves", nil, -1)
+	if err != nil || code != http.StatusOK {
+		return "", nil, fmt.Errorf("PalHook /saves 失败: %v (code=%d)", err, code)
+	}
+	var pr struct {
+		SaveDir string           `json:"save_dir"`
+		Files   []map[string]any `json:"files"`
+	}
+	if err := json.Unmarshal(data, &pr); err != nil {
+		return "", nil, err
+	}
+	return pr.SaveDir, pr.Files, nil
 }
 
 // GET/POST /backups/config
 func (h *BackupHandler) GetConfig(c *gin.Context) {
+	saveDir, _, _ := h.hookSaves()
 	c.JSON(http.StatusOK, gin.H{
-		"save_dir":      h.saveDir(),
+		"save_dir":      saveDir,
 		"backup_dir":    h.backupDir(),
 		"server_online": h.serverOnline(),
 	})
@@ -80,15 +108,11 @@ func (h *BackupHandler) GetConfig(c *gin.Context) {
 
 func (h *BackupHandler) SaveConfig(c *gin.Context) {
 	var req struct {
-		SaveDir   string `json:"save_dir"`
 		BackupDir string `json:"backup_dir"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "bad request"})
 		return
-	}
-	if req.SaveDir != "" {
-		_ = h.cs.Set("save_dir", req.SaveDir)
 	}
 	if req.BackupDir != "" {
 		_ = h.cs.Set("backup_dir", req.BackupDir)
@@ -96,39 +120,28 @@ func (h *BackupHandler) SaveConfig(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
-// GET /backups/saves 当前存档目录内容 (最多50项, 按大小倒序)
+// GET /backups/saves 远程存档文件列表 (代理 hook)
 func (h *BackupHandler) ListSaves(c *gin.Context) {
-	type saveFile struct {
-		Path    string `json:"path"`
-		Size    int64  `json:"size"`
-		ModTime string `json:"mod_time"`
-	}
-	var out []saveFile
-	dir := h.saveDir()
-	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
-		c.JSON(http.StatusOK, gin.H{"save_dir": dir, "exists": false, "files": []saveFile{}})
+	saveDir, files, err := h.hookSaves()
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		return
 	}
-	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() || len(out) >= 200 {
-			return nil
-		}
-		rel, _ := filepath.Rel(dir, path)
-		out = append(out, saveFile{Path: rel, Size: info.Size(), ModTime: info.ModTime().Format("2006-01-02 15:04:05")})
-		return nil
-	})
-	sort.Slice(out, func(i, j int) bool { return out[i].Size > out[j].Size })
-	if len(out) > 50 {
-		out = out[:50]
+	if files == nil {
+		files = []map[string]any{}
 	}
-	c.JSON(http.StatusOK, gin.H{"save_dir": dir, "exists": true, "files": out})
+	c.JSON(http.StatusOK, gin.H{"save_dir": saveDir, "exists": saveDir != "", "files": files})
 }
 
-// POST /backups/create 立即备份 (在线时也可执行, 但会在备注里提示)
+// POST /backups/create 远程备份: 从 hook 拉全部文件打成 zip 存在面板本地
 func (h *BackupHandler) Create(c *gin.Context) {
-	dir := h.saveDir()
-	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "存档目录不存在: " + dir + " (请在配置里设置正确的存档路径)"})
+	saveDir, files, err := h.hookSaves()
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	if len(files) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "远程存档为空 (hook /saves 没有返回文件)"})
 		return
 	}
 	bdir := h.backupDir()
@@ -136,27 +149,61 @@ func (h *BackupHandler) Create(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建备份目录失败: " + err.Error()})
 		return
 	}
-	name := fmt.Sprintf("save-%s.zip", time.Now().Format("20060102-150405"))
+	name := fmt.Sprintf("save-remote-%s.zip", time.Now().Format("20060102-150405"))
 	path := filepath.Join(bdir, name)
-	if err := zipDir(dir, path); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "备份失败: " + err.Error()})
+	zf, err := os.Create(path)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	zw := zip.NewWriter(zf)
+	skipped := 0
+	cc := h.cs.GetConnectionConfig()
+	for _, f := range files {
+		rel, _ := f["path"].(string)
+		if rel == "" {
+			continue
+		}
+		req, err := http.NewRequest(http.MethodGet, cc.PalHookURL+"/saves/download?path="+rel, nil)
+		if err != nil {
+			skipped++
+			continue
+		}
+		req.SetBasicAuth("admin", cc.PalHookPassword)
+		resp, err := h.big.Do(req)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			if resp != nil {
+				resp.Body.Close()
+			}
+			skipped++
+			continue
+		}
+		w, err := zw.Create(rel)
+		if err != nil {
+			resp.Body.Close()
+			skipped++
+			continue
+		}
+		_, _ = io.Copy(w, resp.Body)
+		resp.Body.Close()
+	}
+	_ = zw.Close()
+	_ = zf.Close()
 	st, _ := os.Stat(path)
 	var size int64
 	if st != nil {
 		size = st.Size()
 	}
-	notes := "手动备份"
+	notes := "远程备份 (hook拉取)"
 	if h.serverOnline() {
-		notes = "服务器在线时备份 (存档文件可能处于写入中, 建议停服后备份)"
+		notes = "远程备份 (服务器在线, 存档可能处于写入中)"
 	}
-	_ = h.bs.Add(name, dir, notes, size)
-	h.bs.AuditLog(operator(c), "backup_create", name, dir)
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "filename": name, "size": size})
+	_ = h.bs.Add(name, saveDir, notes, size)
+	h.bs.AuditLog(operator(c), "backup_create_remote", name, saveDir)
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "filename": name, "size": size, "files": len(files), "skipped": skipped})
 }
 
-// GET /backups/list
+// GET /backups/list 本地备份列表
 func (h *BackupHandler) List(c *gin.Context) {
 	list, err := h.bs.List(100)
 	if err != nil {
@@ -169,7 +216,23 @@ func (h *BackupHandler) List(c *gin.Context) {
 	c.JSON(http.StatusOK, list)
 }
 
-// POST /backups/restore {id} 恢复备份 (必须停服)
+// GET /backups/download?id= 下载本地备份 zip
+func (h *BackupHandler) Download(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Query("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
+		return
+	}
+	b, err := h.bs.GetByID(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "备份不存在"})
+		return
+	}
+	zipPath := filepath.Join(h.backupDir(), filepath.Base(b.Filename))
+	c.FileAttachment(zipPath, b.Filename)
+}
+
+// POST /backups/restore {id} 远程恢复: 上传zip内容到hook暂存区并应用 (应用后服务器自动重启)
 func (h *BackupHandler) Restore(c *gin.Context) {
 	var req struct {
 		ID int64 `json:"id"`
@@ -178,30 +241,60 @@ func (h *BackupHandler) Restore(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "id is required"})
 		return
 	}
-	if h.serverOnline() {
-		c.JSON(http.StatusConflict, gin.H{"error": "游戏服务器仍在运行, 请先在MCSM停止服务器再恢复"})
-		return
-	}
 	b, err := h.bs.GetByID(req.ID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "备份不存在"})
 		return
 	}
 	zipPath := filepath.Join(h.backupDir(), filepath.Base(b.Filename))
-	if _, err := os.Stat(zipPath); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "备份文件不存在: " + zipPath})
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "打开备份失败: " + err.Error()})
 		return
 	}
-	// 恢复前先把当前存档再备份一份 (安全网)
-	safety := fmt.Sprintf("save-pre-restore-%s.zip", time.Now().Format("20060102-150405"))
-	_ = zipDir(h.saveDir(), filepath.Join(h.backupDir(), safety))
-	_ = h.bs.Add(safety, h.saveDir(), "恢复前自动备份", 0)
-	if err := unzipDir(zipPath, h.saveDir()); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "恢复失败: " + err.Error()})
+	defer zr.Close()
+	cc := h.cs.GetConnectionConfig()
+	uploaded := 0
+	for _, f := range zr.File {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			continue
+		}
+		data, err := io.ReadAll(io.LimitReader(rc, 512<<20))
+		rc.Close()
+		if err != nil {
+			continue
+		}
+		req2, err := http.NewRequest(http.MethodPost,
+			cc.PalHookURL+"/saves/stage?path="+f.Name, bytes.NewReader(data))
+		if err != nil {
+			continue
+		}
+		req2.SetBasicAuth("admin", cc.PalHookPassword)
+		req2.ContentLength = int64(len(data))
+		resp, err := h.big.Do(req2)
+		if err != nil {
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			uploaded++
+		}
+	}
+	if uploaded == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "没有成功上传任何文件"})
 		return
 	}
-	h.bs.AuditLog(operator(c), "backup_restore", b.Filename, h.saveDir())
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "note": "恢复完成, 请启动游戏服务器"})
+	_, code, _ := h.hookDo(http.MethodPost, "/saves/apply", nil, -1)
+	if code != http.StatusOK {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "应用存档失败 (hook /saves/apply)"})
+		return
+	}
+	h.bs.AuditLog(operator(c), "backup_restore_remote", b.Filename, fmt.Sprintf("%d files", uploaded))
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "restarting": true, "uploaded": uploaded, "note": "存档已上传并应用, 服务器正在重启"})
 }
 
 // POST /backups/delete {id}
@@ -218,13 +311,12 @@ func (h *BackupHandler) Delete(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "备份不存在"})
 		return
 	}
-	zipPath := filepath.Join(h.backupDir(), filepath.Base(b.Filename))
-	_ = os.Remove(zipPath)
+	_ = os.Remove(filepath.Join(h.backupDir(), filepath.Base(b.Filename)))
 	_ = h.bs.Delete(req.ID)
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
-// POST /backups/wipe {scope:"players"|"world"} 删档 (必须停服, 删前自动备份)
+// POST /backups/wipe {scope} 远程删档: 先自动远程备份, 再让 hook 删档并重启
 func (h *BackupHandler) Wipe(c *gin.Context) {
 	var req struct {
 		Scope string `json:"scope"`
@@ -237,113 +329,87 @@ func (h *BackupHandler) Wipe(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "scope 必须是 players(仅玩家角色) 或 world(整个世界)"})
 		return
 	}
-	if h.serverOnline() {
-		c.JSON(http.StatusConflict, gin.H{"error": "游戏服务器仍在运行, 请先在MCSM停止服务器再删档"})
+	// 删档前强制远程备份 (失败则拒绝删档)
+	if err := h.createBackupInternal("删档前自动备份"); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "删档前自动备份失败, 已中止: " + err.Error()})
 		return
 	}
-	dir := h.saveDir()
-	// 删档前强制备份
-	safety := fmt.Sprintf("save-pre-wipe-%s.zip", time.Now().Format("20060102-150405"))
+	body, _ := json.Marshal(map[string]string{"scope": req.Scope})
+	data, code, err := h.hookDo(http.MethodPost, "/saves/wipe", bytes.NewReader(body), int64(len(body)))
+	if err != nil || code != http.StatusOK {
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("删档失败: %v (code=%d) %s", err, code, string(data))})
+		return
+	}
+	h.bs.AuditLog(operator(c), "wipe_remote_"+req.Scope, "", "")
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "restarting": true, "note": "删档完成, 服务器正在重启为全新存档"})
+}
+
+// POST /backups/restart 远程重启游戏服务器 (hook _exit, MCSM自动拉起)
+func (h *BackupHandler) Restart(c *gin.Context) {
+	data, code, err := h.hookDo(http.MethodPost, "/saves/restart", nil, -1)
+	if err != nil || code != http.StatusOK {
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("重启失败: %v (code=%d) %s", err, code, string(data))})
+		return
+	}
+	h.bs.AuditLog(operator(c), "restart_remote", "", "")
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "restarting": true})
+}
+
+// createBackupInternal 内部远程备份 (删档前自动调用)
+func (h *BackupHandler) createBackupInternal(note string) error {
+	saveDir, files, err := h.hookSaves()
+	if err != nil {
+		return err
+	}
+	if len(files) == 0 {
+		return fmt.Errorf("远程存档为空")
+	}
 	bdir := h.backupDir()
 	_ = os.MkdirAll(bdir, 0o755)
-	if err := zipDir(dir, filepath.Join(bdir, safety)); err == nil {
-		_ = h.bs.Add(safety, dir, "删档前自动备份", 0)
-	}
-	// 找世界目录 SaveGames/0/<32位hex GUID>/
-	worldRe := regexp.MustCompile("^[0-9A-Fa-f]{32}$")
-	var deleted []string
-	entries, _ := os.ReadDir(dir)
-	for _, e := range entries {
-		if !e.IsDir() || !worldRe.MatchString(e.Name()) {
-			continue
-		}
-		worldDir := filepath.Join(dir, e.Name())
-		if req.Scope == "world" {
-			if err := os.RemoveAll(worldDir); err == nil {
-				deleted = append(deleted, worldDir)
-			}
-		} else {
-			playersDir := filepath.Join(worldDir, "Players")
-			if st, err := os.Stat(playersDir); err == nil && st.IsDir() {
-				if err := os.RemoveAll(playersDir); err == nil {
-					deleted = append(deleted, playersDir+"/*")
-					_ = os.MkdirAll(playersDir, 0o755)
-				}
-			}
-		}
-	}
-	if len(deleted) == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "未找到可删除的存档 (检查存档目录配置)"})
-		return
-	}
-	h.bs.AuditLog(operator(c), "wipe_"+req.Scope, strings.Join(deleted, ", "), dir)
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "deleted": deleted, "backup": safety, "note": "删档完成, 启动服务器后即为全新存档"})
-}
-
-// zipDir 把目录递归打包成 zip
-func zipDir(srcDir, zipPath string) error {
-	zf, err := os.Create(zipPath)
+	name := fmt.Sprintf("save-remote-%s.zip", time.Now().Format("20060102-150405"))
+	path := filepath.Join(bdir, name)
+	zf, err := os.Create(path)
 	if err != nil {
 		return err
 	}
-	defer zf.Close()
 	zw := zip.NewWriter(zf)
-	defer zw.Close()
-	return filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
+	cc := h.cs.GetConnectionConfig()
+	ok := 0
+	for _, f := range files {
+		rel, _ := f["path"].(string)
+		if rel == "" {
+			continue
+		}
+		req, err := http.NewRequest(http.MethodGet, cc.PalHookURL+"/saves/download?path="+rel, nil)
 		if err != nil {
-			return err
+			continue
 		}
-		if info.IsDir() {
-			return nil
+		req.SetBasicAuth("admin", cc.PalHookPassword)
+		resp, err := h.big.Do(req)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			if resp != nil {
+				resp.Body.Close()
+			}
+			continue
 		}
-		rel, err := filepath.Rel(srcDir, path)
-		if err != nil {
-			return err
+		w, err := zw.Create(rel)
+		if err == nil {
+			_, _ = io.Copy(w, resp.Body)
+			ok++
 		}
-		wf, err := zw.Create(rel)
-		if err != nil {
-			return err
-		}
-		f, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		_, err = io.Copy(wf, f)
-		return err
-	})
-}
-
-// unzipDir 解压 zip 到目标目录 (覆盖)
-func unzipDir(zipPath, dstDir string) error {
-	zr, err := zip.OpenReader(zipPath)
-	if err != nil {
-		return err
+		resp.Body.Close()
 	}
-	defer zr.Close()
-	for _, f := range zr.File {
-		// 防路径穿越
-		dst := filepath.Join(dstDir, filepath.Clean("/"+f.Name))
-		if !strings.HasPrefix(dst, filepath.Clean(dstDir)+string(os.PathSeparator)) && dst != filepath.Clean(dstDir) {
-			continue
-		}
-		if f.FileInfo().IsDir() {
-			_ = os.MkdirAll(dst, 0o755)
-			continue
-		}
-		_ = os.MkdirAll(filepath.Dir(dst), 0o755)
-		rc, err := f.Open()
-		if err != nil {
-			continue
-		}
-		wf, err := os.Create(dst)
-		if err != nil {
-			rc.Close()
-			continue
-		}
-		_, _ = io.Copy(wf, rc)
-		wf.Close()
-		rc.Close()
+	_ = zw.Close()
+	_ = zf.Close()
+	if ok == 0 {
+		_ = os.Remove(path)
+		return fmt.Errorf("所有文件下载失败")
 	}
+	st, _ := os.Stat(path)
+	var size int64
+	if st != nil {
+		size = st.Size()
+	}
+	_ = h.bs.Add(name, saveDir, note, size)
 	return nil
 }

@@ -8,10 +8,12 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/shinegod/palworld-manager/internal/store"
 )
 
 type EventHandler struct {
-	db *sql.DB
+	db        *sql.DB
+	scheduler *EventScheduler
 }
 
 type EventRow struct {
@@ -38,8 +40,13 @@ type EventCreateReq struct {
 	OnEndActions  string `json:"on_end_actions"`
 }
 
-func NewEventHandler(db *sql.DB) *EventHandler {
-	return &EventHandler{db: db}
+func NewEventHandler(db *sql.DB, cs *store.ConfigStore) *EventHandler {
+	return &EventHandler{db: db, scheduler: NewEventScheduler(db, cs)}
+}
+
+// Scheduler 暴露给 main 启动后台调度循环
+func (h *EventHandler) Scheduler() *EventScheduler {
+	return h.scheduler
 }
 
 func (h *EventHandler) List(c *gin.Context) {
@@ -145,7 +152,17 @@ func (h *EventHandler) Trigger(c *gin.Context) {
 		return
 	}
 
+	// 真正执行动作 (广播/聊天/重启), 不再只是标记一下
+	errs := h.scheduler.ExecuteActions(actions)
 	h.db.Exec(`UPDATE events SET last_run=? WHERE id=?`, time.Now().Format(time.RFC3339), id)
 
+	if len(errs) > 0 {
+		msgs := make([]string, 0, len(errs))
+		for _, e := range errs {
+			msgs = append(msgs, e.Error())
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "event triggered with errors", "errors": msgs})
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "event triggered", "actions": json.RawMessage(actions)})
 }

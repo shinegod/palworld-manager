@@ -27,9 +27,10 @@
 #include <sys/types.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>   /* process_vm_readv: 读无效地址返回EFAULT而非触发SIGSEGV */
+#include <sys/stat.h>  /* 存档文件列表/下载 */
 
 #define PALHOOK_PORT 13335
-#define PALHOOK_VERSION "0.9.21"
+#define PALHOOK_VERSION "0.9.22"
 #define MAX_REQUEST 16384
 #define MAX_RESPONSE 262144
 #define LOG_PREFIX "[PalHook] "
@@ -69,6 +70,8 @@ static void*  g_ConsoleManager = NULL;
 static char g_admin_password[128] = {0};
 /* 服务器名 (从同一配置读取ServerName, 面板展示用) */
 static char g_server_name[256] = {0};
+/* 成功读到密码的ini路径 (远程存档管理用它推导 SaveGames 目录) */
+static char g_ini_path[640] = {0};
 
 /* 测试VPS加载基址 (所有硬编码地址以它为基准换算成偏移, 生产环境ASLR安全) */
 #define VPS_BASE_ADDR 0x200000
@@ -299,6 +302,7 @@ static int read_ini_password(const char* path) {
             memcpy(raw, ap, (size_t)rl);
             raw[rl] = '\0';
             finalize_password_value(raw, rl);
+            snprintf(g_ini_path, sizeof(g_ini_path), "%s", path);
             palhook_log("loaded AdminPassword from %s (%d chars)", path, (int)strlen(g_admin_password));
             fclose(f);
             return 1;
@@ -555,7 +559,8 @@ static int is_dangerous_path(const char* path) {
         "/writemem", "/readmem", "/call-function", "/cheat",
         "/search-bytes", "/find-value", "/scan",
         "/maps", "/meminfo", "/find-class", "/find-vtable",
-        "/find-players", "/dump-guilds", "/get-npc-manager", NULL
+        "/find-players", "/dump-guilds", "/get-npc-manager",
+        "/saves", NULL
     };
     for (int i = 0; deny[i]; i++) {
         size_t n = strlen(deny[i]);
@@ -6468,6 +6473,258 @@ static void api_find_value(int fd, const char* req) {
 
 /* ========== HTTP路由 ========== */
 
+/* ========== 远程存档管理 (v0.9.22) ==========
+ * 面板与游戏服通常不在同一台机器, 备份/恢复/删档都走这里:
+ *   GET  /saves             存档文件列表
+ *   GET  /saves/download    下载单个文件 (二进制流)
+ *   POST /saves/stage       上传文件到暂存区 /tmp/palhook-stage/
+ *   POST /saves/apply       暂存区覆盖存档目录, 然后进程退出重启
+ *   POST /saves/wipe        删档 (players=角色 / world=世界), 然后进程退出重启
+ *   POST /saves/restart     仅重启游戏进程 (由MCSM守护自动拉起)
+ * 进程退出用 _exit(0): 不触发UE的存档回调, 删档/恢复后的内存状态不会被写回磁盘 */
+
+static __thread int g_req_bytes = 0;
+static char g_saves_dir[640] = {0};
+
+/* URL解码 (%XX), 用于 path 参数 (面板可能把/编码成%2F) */
+static int hexval(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static void url_decode(const char* in, char* out, size_t out_size) {
+    size_t o = 0;
+    for (const char* p = in; *p && o < out_size - 1; p++) {
+        if (*p == '%' && p[1] && p[2]) {
+            int hi = hexval(p[1]), lo = hexval(p[2]);
+            if (hi >= 0 && lo >= 0) {
+                out[o++] = (char)((hi << 4) | lo);
+                p += 2;
+                continue;
+            }
+        }
+        out[o++] = *p;
+    }
+    out[o] = 0;
+}
+
+/* 相对路径校验: 拒绝绝对路径 / .. / 反斜杠 (防路径穿越) */
+static int valid_rel_path(const char* p) {
+    if (!p || !p[0] || p[0] == '/') return 0;
+    if (strstr(p, "..")) return 0;
+    if (strchr(p, '\\')) return 0;
+    return 1;
+}
+
+/* 推导存档目录: 优先从成功读取的ini路径算, 再试常见固定路径 */
+static const char* discover_saves_dir(void) {
+    if (g_saves_dir[0]) return g_saves_dir;
+    if (g_ini_path[0]) {
+        const char* marker = "/Pal/Saved/Config/LinuxServer/PalWorldSettings.ini";
+        size_t ml = strlen(marker);
+        size_t bl = strlen(g_ini_path);
+        if (bl >= ml && strcmp(g_ini_path + bl - ml, marker) == 0) {
+            char base[512];
+            snprintf(base, sizeof(base), "%s", g_ini_path);
+            base[bl - ml] = 0;
+            snprintf(g_saves_dir, sizeof(g_saves_dir), "%s/Pal/Saved/SaveGames", base);
+            if (access(g_saves_dir, F_OK) == 0) return g_saves_dir;
+            g_saves_dir[0] = 0;
+        }
+    }
+    static const char* fixed[] = {
+        "/workspace/pal/Pal/Saved/SaveGames",
+        "/palworld/Pal/Saved/SaveGames",
+        "/home/steam/palworld/Pal/Saved/SaveGames",
+        NULL
+    };
+    for (int i = 0; fixed[i]; i++) {
+        if (access(fixed[i], F_OK) == 0) {
+            snprintf(g_saves_dir, sizeof(g_saves_dir), "%s", fixed[i]);
+            return g_saves_dir;
+        }
+    }
+    return NULL;
+}
+
+/* 延迟退出进程 (给HTTP响应留出发送时间; MCSM守护进程会自动拉起新实例) */
+static void* exit_thread_fn(void* arg) {
+    (void)arg;
+    sleep(1);
+    _exit(0);
+}
+
+static void schedule_exit(void) {
+    pthread_t t;
+    if (pthread_create(&t, NULL, exit_thread_fn, NULL) == 0) pthread_detach(t);
+}
+
+static void api_saves_list(int fd) {
+    const char* sd = discover_saves_dir();
+    char* buf = (char*)malloc(MAX_RESPONSE);
+    if (!buf) { json_err(fd, 500, "malloc failed"); return; }
+    int pos = snprintf(buf, MAX_RESPONSE, "{\"save_dir\":\"%s\",\"files\":[", sd ? sd : "");
+    if (sd) {
+        char cmd[700];
+        snprintf(cmd, sizeof(cmd), "find '%s' -type f 2>/dev/null | head -300", sd);
+        FILE* fp = popen(cmd, "r");
+        if (fp) {
+            char line[640];
+            int first = 1;
+            while (fgets(line, sizeof(line), fp)) {
+                line[strcspn(line, "\n")] = 0;
+                struct stat st;
+                if (stat(line, &st) != 0) continue;
+                if (pos > MAX_RESPONSE - 512) break;
+                if (!first) buf[pos++] = ',';
+                first = 0;
+                const char* rel = line + strlen(sd) + 1;
+                pos += snprintf(buf + pos, MAX_RESPONSE - (size_t)pos,
+                    "{\"path\":\"%s\",\"size\":%ld,\"mtime\":%ld}",
+                    rel, (long)st.st_size, (long)st.st_mtime);
+            }
+            pclose(fp);
+        }
+    }
+    pos += snprintf(buf + pos, MAX_RESPONSE - (size_t)pos, "]}");
+    json_ok(fd, buf);
+    free(buf);
+}
+
+static void api_saves_download(int fd, const char* req) {
+    const char* sd = discover_saves_dir();
+    if (!sd) { json_err(fd, 404, "save dir not found"); return; }
+    const char* p = strstr(req, "path=");
+    if (!p) { json_err(fd, 400, "path required"); return; }
+    p += 5;
+    char raw[512];
+    int i = 0;
+    while (p[i] && p[i] != ' ' && p[i] != '&' && i < 500) { raw[i] = p[i]; i++; }
+    raw[i] = 0;
+    char rel[512];
+    url_decode(raw, rel, sizeof(rel));
+    if (!valid_rel_path(rel)) { json_err(fd, 400, "invalid path"); return; }
+    char full[700];
+    snprintf(full, sizeof(full), "%s/%s", sd, rel);
+    FILE* f = fopen(full, "rb");
+    if (!f) { json_err(fd, 404, "file not found"); return; }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 0 || sz > 512L * 1024 * 1024) { fclose(f); json_err(fd, 400, "file too large"); return; }
+    char hdr[256];
+    int hlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %ld\r\nConnection: close\r\n\r\n", sz);
+    send(fd, hdr, (size_t)hlen, MSG_NOSIGNAL);
+    char chunk[65536];
+    size_t n;
+    while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0) {
+        if (send(fd, chunk, n, MSG_NOSIGNAL) <= 0) break;
+    }
+    fclose(f);
+}
+
+static void api_saves_stage(int fd, const char* req) {
+    const char* p = strstr(req, "path=");
+    if (!p) { json_err(fd, 400, "path required"); return; }
+    p += 5;
+    char raw[512];
+    int i = 0;
+    while (p[i] && p[i] != ' ' && p[i] != '&' && i < 500) { raw[i] = p[i]; i++; }
+    raw[i] = 0;
+    char rel[512];
+    url_decode(raw, rel, sizeof(rel));
+    if (!valid_rel_path(rel)) { json_err(fd, 400, "invalid path"); return; }
+    const char* cl = strstr(req, "Content-Length:");
+    if (!cl) { json_err(fd, 400, "Content-Length required"); return; }
+    long clen = atol(cl + 15);
+    if (clen <= 0 || clen > 512L * 1024 * 1024) { json_err(fd, 400, "body too large"); return; }
+    /* 逐级创建暂存父目录 */
+    mkdir("/tmp/palhook-stage", 0755);
+    {
+        char tmp[512];
+        snprintf(tmp, sizeof(tmp), "%s", rel);
+        for (char* s = tmp; *s; s++) {
+            if (*s == '/') {
+                *s = 0;
+                char d[700];
+                snprintf(d, sizeof(d), "/tmp/palhook-stage/%s", tmp);
+                mkdir(d, 0755);
+                *s = '/';
+            }
+        }
+    }
+    char stage_path[700];
+    snprintf(stage_path, sizeof(stage_path), "/tmp/palhook-stage/%s", rel);
+    FILE* f = fopen(stage_path, "wb");
+    if (!f) { json_err(fd, 500, "cannot write stage file"); return; }
+    long remaining = clen;
+    const char* bs = strstr(req, "\r\n\r\n");
+    if (!bs) { fclose(f); json_err(fd, 400, "bad request"); return; }
+    bs += 4;
+    /* 已随header收到的body字节数 = 本次recv总数 - header长度 (req是二进制, strlen不可靠) */
+    long got = (long)g_req_bytes - (long)(bs - req);
+    if (got > remaining) got = remaining;
+    if (got > 0) { fwrite(bs, 1, (size_t)got, f); remaining -= got; }
+    char rbuf[65536];
+    while (remaining > 0) {
+        size_t want = remaining < (long)sizeof(rbuf) ? (size_t)remaining : sizeof(rbuf);
+        ssize_t n = recv(fd, rbuf, want, 0);
+        if (n <= 0) break;
+        fwrite(rbuf, 1, (size_t)n, f);
+        remaining -= (long)n;
+    }
+    fclose(f);
+    if (remaining > 0) { json_err(fd, 400, "body truncated"); return; }
+    json_ok(fd, "{\"status\":\"ok\",\"staged\":true}");
+}
+
+static void api_saves_apply(int fd) {
+    const char* sd = discover_saves_dir();
+    if (!sd) { json_err(fd, 404, "save dir not found"); return; }
+    if (access("/tmp/palhook-stage", F_OK) != 0) { json_err(fd, 400, "no staged files"); return; }
+    char cmd[900];
+    snprintf(cmd, sizeof(cmd), "cp -a /tmp/palhook-stage/. '%s/' 2>&1", sd);
+    int rc = system(cmd);
+    if (rc != 0) { json_err(fd, 500, "apply failed"); return; }
+    system("rm -rf /tmp/palhook-stage");
+    palhook_log("saves/apply: 存档已覆盖, 进程即将退出重启");
+    json_ok(fd, "{\"status\":\"ok\",\"restarting\":true,\"note\":\"存档已应用, 服务器即将重启\"}");
+    schedule_exit();
+}
+
+static void api_saves_wipe(int fd, const char* req) {
+    const char* sd = discover_saves_dir();
+    if (!sd) { json_err(fd, 404, "save dir not found"); return; }
+    char body[256] = {0};
+    read_body(fd, req, body, sizeof(body));
+    char scope[16] = {0};
+    json_get_string(body, "scope", scope, sizeof(scope));
+    if (strcmp(scope, "players") != 0 && strcmp(scope, "world") != 0) {
+        json_err(fd, 400, "scope must be players or world");
+        return;
+    }
+    char cmd[900];
+    if (strcmp(scope, "players") == 0) {
+        snprintf(cmd, sizeof(cmd), "rm -rf '%s'/0/*/Players 2>&1", sd);
+    } else {
+        snprintf(cmd, sizeof(cmd), "rm -rf '%s'/0/* 2>&1", sd);
+    }
+    int rc = system(cmd);
+    if (rc != 0) { json_err(fd, 500, "wipe failed"); return; }
+    palhook_log("saves/wipe: scope=%s 已删除, 进程即将退出重启", scope);
+    json_ok(fd, "{\"status\":\"ok\",\"restarting\":true,\"note\":\"删档完成, 服务器即将重启为全新存档\"}");
+    schedule_exit();
+}
+
+static void api_saves_restart(int fd) {
+    palhook_log("saves/restart: 收到重启指令, 进程即将退出");
+    json_ok(fd, "{\"status\":\"ok\",\"restarting\":true}");
+    schedule_exit();
+}
+
 static void handle_request(int fd) {
     /* 刷新内存映射 (新mmap的FNamePool块等)。
        /proc/self/maps 有几百行, 并发请求各解析一遍纯属浪费, 这里做短期合并。
@@ -6487,6 +6744,7 @@ static void handle_request(int fd) {
     char req[MAX_REQUEST] = {0};
     int n = recv(fd, req, sizeof(req) - 1, 0);
     if (n <= 0) { close(fd); return; }
+    g_req_bytes = n; /* 供大body上传端点使用 (req含二进制, strlen不可靠) */
 
     char method[16] = {0}, path[256] = {0};
     sscanf(req, "%15s %255s", method, path);
@@ -6571,6 +6829,18 @@ static void handle_request(int fd) {
         api_cheat(fd, req);
     } else if (strcmp(path, "/set-tech-points") == 0) {
         api_set_tech_points(fd, req);
+    } else if (strcmp(path, "/saves") == 0) {
+        api_saves_list(fd);
+    } else if (strncmp(path, "/saves/download", 15) == 0) {
+        api_saves_download(fd, req);
+    } else if (strncmp(path, "/saves/stage", 12) == 0) {
+        api_saves_stage(fd, req);
+    } else if (strcmp(path, "/saves/apply") == 0) {
+        api_saves_apply(fd);
+    } else if (strcmp(path, "/saves/wipe") == 0) {
+        api_saves_wipe(fd, req);
+    } else if (strcmp(path, "/saves/restart") == 0) {
+        api_saves_restart(fd);
     } else {
         json_err(fd, 404, "endpoint not found, try /help");
     }

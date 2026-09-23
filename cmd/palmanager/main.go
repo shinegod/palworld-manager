@@ -52,7 +52,7 @@ func main() {
 	// Handlers
 	authHandler := handler.NewAuthHandler(&cfg.Auth)
 	appConfigHandler := handler.NewAppConfigHandler(configStore)
-	eventHandler := handler.NewEventHandler(db)
+	eventHandler := handler.NewEventHandler(db, configStore)
 	palhookHandler := handler.NewPalHookHandler(configStore)
 	hookPlayers := handler.NewPalHookPlayersHandler(configStore, banStore, playerStore)
 	hookDash := handler.NewHookDashboardHandler(configStore)
@@ -153,6 +153,8 @@ func main() {
 		api.POST("/backups/restore", backupHandler.Restore)
 		api.POST("/backups/delete", backupHandler.Delete)
 		api.POST("/backups/wipe", backupHandler.Wipe)
+		api.GET("/backups/download", backupHandler.Download)
+		api.POST("/backups/restart", backupHandler.Restart)
 	}
 
 	// Embedded frontend with SPA fallback
@@ -175,6 +177,9 @@ func main() {
 	// 后台历史快照轮询 (只打 PalHook /players, 60s一次)
 	historyStop := make(chan struct{})
 	go handler.StartHookHistoryRecorder(configStore, playerStore, anticheatHandler, historyStop)
+
+	// 事件系统定时调度器 (单次/循环/Cron 触发公告/聊天/重启)
+	go eventHandler.Scheduler().Start(historyStop)
 
 	// Start server
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Server.Port)
