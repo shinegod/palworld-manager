@@ -23,11 +23,11 @@ func (s *PlayerStore) Upsert(p model.Player) error {
 	return err
 }
 
-// UpsertPlayerSnapshot 轻量快照: 仅更新在线玩家名字/等级/在线状态 (PalHook轮询用)
-func (s *PlayerStore) UpsertPlayerSnapshot(uid, name string, level int) error {
+// UpsertPlayerSnapshot 轻量快照: 更新在线玩家名字/等级/IP/平台/在线状态 (PalHook轮询用)
+func (s *PlayerStore) UpsertPlayerSnapshot(uid, name, ip, platform string, level int) error {
 	_, err := s.db.Exec(`INSERT INTO player_history (uid, steam_id, name, account_name, level, ip, platform, online, first_seen, last_seen) VALUES (?,?,?,?,?,?,?,?,?,?)
-		ON CONFLICT(uid) DO UPDATE SET name=excluded.name, level=excluded.level, online=excluded.online, last_seen=excluded.last_seen`,
-		uid, "", name, "", level, "", "", true, time.Now(), time.Now(),
+		ON CONFLICT(uid) DO UPDATE SET name=excluded.name, level=excluded.level, ip=excluded.ip, platform=excluded.platform, online=excluded.online, last_seen=excluded.last_seen`,
+		uid, "", name, "", level, ip, platform, true, time.Now(), time.Now(),
 	)
 	return err
 }

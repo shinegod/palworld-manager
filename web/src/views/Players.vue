@@ -87,7 +87,16 @@
           <el-table-column prop="level" label="等级" width="80" align="center" />
           <el-table-column prop="platform" label="平台" width="100" align="center">
             <template #default="{ row }">
-              <el-tag size="small" type="info">{{ row.platform ?? '未知' }}</el-tag>
+              <el-tag size="small" :type="row.platform === 'Steam' ? 'success' : 'info'">{{ row.platform || guessPlatform(row.uid) }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="IP" min-width="150">
+            <template #default="{ row }">
+              <span v-if="flagEmoji(ipInfos[row.ip]?.countryCode)" class="flag">{{ flagEmoji(ipInfos[row.ip]?.countryCode) }}</span>
+              <span>{{ row.ip || '—' }}</span>
+              <span v-if="ipInfos[row.ip]?.country" class="ip-geo">
+                {{ ipInfos[row.ip].country }} {{ ipInfos[row.ip].regionName || '' }} {{ ipInfos[row.ip].city || '' }}
+              </span>
             </template>
           </el-table-column>
           <el-table-column label="首次登录" min-width="160">
@@ -314,6 +323,7 @@ interface HistoryPlayer {
   last_seen: string
   total_playtime_seconds: number
   platform: string
+  ip: string
 }
 
 interface BanRecord {
@@ -409,7 +419,10 @@ function pingClass(ping: number): string {
 const ipInfos = ref<Record<string, any>>({})
 
 async function fetchIpInfos() {
-  const ips = Array.from(new Set(onlinePlayers.value.map((p) => p.iP).filter((ip) => ip && ip !== '0.0.0.0')))
+  const ips = Array.from(new Set([
+    ...onlinePlayers.value.map((p) => p.iP).filter((ip) => ip && ip !== '0.0.0.0'),
+    ...historyPlayers.value.map((p) => p.ip).filter((ip) => ip && ip !== '0.0.0.0'),
+  ]))
   for (const ip of ips) {
     try {
       const res = await http.get('/ipinfo', { params: { ip }, timeout: 8000 })
@@ -481,6 +494,7 @@ async function fetchHistory() {
       params: { limit: historyPageSize, offset },
     })
     historyPlayers.value = res.data ?? []
+    fetchIpInfos()
     if (historyPlayers.value.length < historyPageSize && historyPage.value === 1) {
       historyTotal.value = historyPlayers.value.length
     } else {

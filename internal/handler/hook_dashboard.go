@@ -208,8 +208,10 @@ func StartHookHistoryRecorder(cs *store.ConfigStore, ps *store.PlayerStore, stop
 				if v, ok := p["level"].(float64); ok {
 					lvl = int(v)
 				}
+				ip, _ := p["ip"].(string)
+				platform, _ := p["platform"].(string)
 				nowOnline[uid] = true
-				_ = ps.UpsertPlayerSnapshot(uid, name, lvl)
+				_ = ps.UpsertPlayerSnapshot(uid, name, ip, platform, lvl)
 				// 在线时长累加: 每轮 +interval
 				_ = ps.AddPlaytime(uid, int64(interval.Seconds()))
 			}
