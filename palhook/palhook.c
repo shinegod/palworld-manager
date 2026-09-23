@@ -29,7 +29,7 @@
 #include <sys/uio.h>   /* process_vm_readv: 读无效地址返回EFAULT而非触发SIGSEGV */
 
 #define PALHOOK_PORT 13335
-#define PALHOOK_VERSION "0.9.19"
+#define PALHOOK_VERSION "0.9.20"
 #define MAX_REQUEST 16384
 #define MAX_RESPONSE 262144
 #define LOG_PREFIX "[PalHook] "
@@ -430,8 +430,11 @@ static int scan_memory_for_admin_password(void) {
             long hit = safe_memmem_remote(seg_start, size, (const uint8_t*)pat_narrow, sizeof(pat_narrow) - 1);
             if (hit >= 0 && bulk_read(seg_start + (size_t)hit + sizeof(pat_narrow) - 1, nbuf, sizeof(nbuf)) > 0) {
                 char out[128]; int o = 0;
+                /* 注意不能写成 out[o++] = nbuf[o]: 同一表达式内既改 o 又用 o
+                 * 索引是未定义行为, 实测会让密码读错一个字节 */
                 while (o < 127 && nbuf[o] != '"' && nbuf[o] != 0) {
-                    out[o++] = (char)nbuf[o];
+                    out[o] = (char)nbuf[o];
+                    o++;
                 }
                 out[o] = 0;
                 if (o > 0) {
@@ -452,7 +455,7 @@ static void load_admin_password(void) {
     /* 1. 环境变量覆盖 */
     const char* env = getenv("PALHOOK_PASSWORD");
     if (env && env[0]) {
-        strncpy(g_admin_password, env, 127);
+        snprintf(g_admin_password, sizeof(g_admin_password), "%s", env);
         palhook_log("loaded password from PALHOOK_PASSWORD env");
         return;
     }
@@ -649,7 +652,9 @@ static int parse_proc_maps(void) {
             if (g_bin_segment_count < MAX_SEGMENTS) {
                 g_bin_segments[g_bin_segment_count].start = start;
                 g_bin_segments[g_bin_segment_count].end = end;
-                strncpy(g_bin_segments[g_bin_segment_count].perms, perms, 7);
+                /* snprintf 保证补\0; strncpy 填满缓冲时不补, 后续读取会越界 */
+                snprintf(g_bin_segments[g_bin_segment_count].perms,
+                         sizeof(g_bin_segments[g_bin_segment_count].perms), "%s", perms);
                 g_bin_segment_count++;
             }
             if (!found_first) {
@@ -1188,13 +1193,7 @@ static void api_search_bytes(int fd, const char* req) {
         }
     }
 
-    /* 也搜索rodata段 (FNamePool blocks可能在mmap区域) */
-    /* 搜索text段前面的rodata */
-    if (found < max_results && g_base_addr > 0) {
-        uintptr_t ro_start = g_base_addr;  /* 0x200000 */
-        uintptr_t ro_end = g_base_addr + g_text_size + 0x4000000; /* 包含rodata */
-        /* 不搜rodata了太大了 */
-    }
+    /* 不搜 rodata 段: 范围太大(64MB+), 收益不足 */
 
     snprintf(buf + pos, 65536 - pos, "],\"total_found\":%d}", found);
     json_ok(fd, buf);
@@ -1940,7 +1939,8 @@ static int find_fname_index(const char* target_name) {
                     int fname_index = (block << 16) | fname_offset;
                     /* 写缓存 */
                     if (g_fname_cache_count < FNAME_CACHE_SIZE) {
-                        strncpy(g_fname_cache[g_fname_cache_count].name, target_name, 127);
+                        snprintf(g_fname_cache[g_fname_cache_count].name,
+                                 sizeof(g_fname_cache[g_fname_cache_count].name), "%s", target_name);
                         g_fname_cache[g_fname_cache_count].idx = fname_index;
                         g_fname_cache_count++;
                     }
@@ -1988,7 +1988,8 @@ static int find_fname_index(const char* target_name) {
                         int fname_index = (block << 16) | fname_offset;
                         palhook_log("fname '%s' = %d (wide)", target_name, fname_index);
                         if (g_fname_cache_count < FNAME_CACHE_SIZE) {
-                            strncpy(g_fname_cache[g_fname_cache_count].name, target_name, 127);
+                            snprintf(g_fname_cache[g_fname_cache_count].name,
+                                     sizeof(g_fname_cache[g_fname_cache_count].name), "%s", target_name);
                             g_fname_cache[g_fname_cache_count].idx = fname_index;
                             g_fname_cache_count++;
                         }
@@ -3925,9 +3926,12 @@ static int actor_get_location(uintptr_t actor, double* out) {
                         if (safe_read_ptr(root + rl_off + 0, &d0) == 0 &&
                             safe_read_ptr(root + rl_off + 8, &d1) == 0 &&
                             safe_read_ptr(root + rl_off + 16, &d2) == 0) {
-                            out[0] = *(double*)&d0;
-                            out[1] = *(double*)&d1;
-                            out[2] = *(double*)&d2;
+                            /* memcpy 而非 *(double*)&d0: 后者违反严格别名规则,
+                             * -O2 下优化器可重排/缓存读取导致取到垃圾值,
+                             * 坐标读错再喂给UE范围查询会崩 */
+                            memcpy(&out[0], &d0, sizeof(double));
+                            memcpy(&out[1], &d1, sizeof(double));
+                            memcpy(&out[2], &d2, sizeof(double));
                             /* 残影对象可能读出NaN/超大值, 直接喂给UE的范围查询会崩 */
                             if (isfinite(out[0]) && isfinite(out[1]) && isfinite(out[2]) &&
                                 fabs(out[0]) < 1e7 && fabs(out[1]) < 1e7 && fabs(out[2]) < 1e7) {
@@ -4383,7 +4387,8 @@ static void api_spawn_pal_v2(int fd, const char* req) {
         if (string_to_fname(pal_id, &dyn_idx) == 0 && dyn_idx > 0) {
             pal_fname = dyn_idx;
             if (g_fname_cache_count < FNAME_CACHE_SIZE) {
-                strncpy(g_fname_cache[g_fname_cache_count].name, pal_id, 127);
+                snprintf(g_fname_cache[g_fname_cache_count].name,
+                         sizeof(g_fname_cache[g_fname_cache_count].name), "%s", pal_id);
                 g_fname_cache[g_fname_cache_count].idx = pal_fname;
                 g_fname_cache_count++;
             }
@@ -4725,10 +4730,11 @@ static void api_writemem(int fd, const char* req) {
             char* end = NULL;
             uint64_t v = strtoull(qp, &end, 0);
             if (end == qp) break;
-            if (region_contains(cur) && region_contains(cur + 7)) {
-                *(volatile uintptr_t*)cur = (uintptr_t)v;
+            {
+                uintptr_t val = (uintptr_t)v;
+                if (safe_write_mem(cur, &val, sizeof(val)) != 0) break;
                 count++;
-            } else break;
+            }
             cur += 8;
             qp = end;
             while (*qp == ',' || *qp == ' ') qp++;
@@ -4739,10 +4745,15 @@ static void api_writemem(int fd, const char* req) {
         return;
     }
 
-    /* 单值: {"addr":"0x..","value":"0x.."} 或 {"addr":"0x..","value":123} */
+    /* 单值: {"addr":"0x..","value":"0x.."} 或 {"addr":"0x..","value":123}
+     * 走 safe_write_mem: 原先裸写且不查映射, 地址无效直接崩游戏进程 */
     char val_str[64] = {0};
     if (json_get_string(body, "value", val_str, sizeof(val_str)) == 0 && val_str[0]) {
-        *(volatile uintptr_t*)addr = strtoull(val_str, NULL, 0);
+        uintptr_t val = strtoull(val_str, NULL, 0);
+        if (safe_write_mem(addr, &val, sizeof(val)) != 0) {
+            json_err(fd, 400, "write failed: address not writable");
+            return;
+        }
         char buf[256];
         snprintf(buf, sizeof(buf), "{\"status\":\"ok\",\"addr\":\"%s\",\"value\":\"%s\"}", addr_str, val_str);
         json_ok(fd, buf);
@@ -4751,7 +4762,11 @@ static void api_writemem(int fd, const char* req) {
     const char* vp = strstr(body, "\"value\":");
     if (vp) {
         vp += 8;
-        *(volatile uintptr_t*)addr = strtoull(vp, NULL, 0);
+        uintptr_t val = strtoull(vp, NULL, 0);
+        if (safe_write_mem(addr, &val, sizeof(val)) != 0) {
+            json_err(fd, 400, "write failed: address not writable");
+            return;
+        }
         char buf[256];
         snprintf(buf, sizeof(buf), "{\"status\":\"ok\",\"addr\":\"%s\"}", addr_str);
         json_ok(fd, buf);
@@ -5303,7 +5318,7 @@ static void fill_player_details(void) {
                         uintptr_t pv = 0;
                         if (safe_read_ptr(ps + poff, &pv) == 0) {
                             if (psz == 1) e->ping = (float)((pv & 0xFF) * 4); /* CompressedPing*4 */
-                            else e->ping = *(float*)&pv;
+                            else { float f; memcpy(&f, &pv, sizeof(f)); e->ping = f; } /* 严格别名: 不能 *(float*)&pv */
                         }
                     }
                 }
