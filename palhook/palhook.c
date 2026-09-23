@@ -29,7 +29,7 @@
 #include <sys/uio.h>   /* process_vm_readv: 读无效地址返回EFAULT而非触发SIGSEGV */
 
 #define PALHOOK_PORT 13335
-#define PALHOOK_VERSION "0.9.20"
+#define PALHOOK_VERSION "0.9.21"
 #define MAX_REQUEST 16384
 #define MAX_RESPONSE 262144
 #define LOG_PREFIX "[PalHook] "
@@ -4846,7 +4846,8 @@ static void api_set_exp(int fd, const char* req) {
     if (set_level) {
         level = json_get_int(body, "level");
         if (level < 1) level = 1;
-        if (level > 50) level = 50;
+        /* 玩家等级上限: 首发50 -> 樱岛55 -> 1.0版本80 (当前游戏 v1.0.5.102999) */
+        if (level > 80) level = 80;
         /* 等级字节在 +0x3F0 (实测: 低字节=等级, 高位是标志位, 只改低字节) */
         uint8_t lv = (uint8_t)level;
         if (safe_write_mem(ip + 0x3F0, &lv, 1) != 0) {

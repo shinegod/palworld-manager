@@ -203,7 +203,7 @@
           <el-button type="primary" :loading="statsLoading" @click="doGiveExp" style="margin-left: 8px">发放</el-button>
         </el-form-item>
         <el-form-item label="设置等级">
-          <el-input-number v-model="statsForm.level" :min="1" :max="50" />
+          <el-input-number v-model="statsForm.level" :min="1" :max="80" />
           <el-button type="primary" :loading="statsLoading" @click="doSetLevel" style="margin-left: 8px">设置</el-button>
         </el-form-item>
         <el-form-item label="加金币">
