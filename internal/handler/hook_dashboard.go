@@ -109,9 +109,6 @@ func (h *HookDashboardHandler) GetInfo(c *gin.Context) {
 }
 
 func (h *HookDashboardHandler) GetTrends(c *gin.Context)   { c.JSON(http.StatusOK, []any{}) }
-func (h *HookDashboardHandler) GetAlerts(c *gin.Context)   { c.JSON(http.StatusOK, []any{}) }
-func (h *HookDashboardHandler) AckAlert(c *gin.Context)    { c.JSON(http.StatusOK, gin.H{"status": "ok"}) }
-func (h *HookDashboardHandler) ClearAlerts(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) }
 
 // GetPlayerPositions 世界地图点位 (来自 PalHook /players 的坐标)
 func (h *HookDashboardHandler) GetPlayerPositions(c *gin.Context) {
@@ -161,12 +158,14 @@ func (h *HookDashboardHandler) GetPlayerPositions(c *gin.Context) {
 	c.JSON(http.StatusOK, out)
 }
 
-// StartHookHistoryRecorder 后台轻量轮询: 把在线玩家快照写入历史库 (60s一次, 只打PalHook)
-func StartHookHistoryRecorder(cs *store.ConfigStore, ps *store.PlayerStore, stop <-chan struct{}) {
+// StartHookHistoryRecorder 后台轻量轮询: 把在线玩家快照写入历史库 (60s一次, 只打PalHook),
+// 顺带跑反作弊检测与服务器在线/离线告警
+func StartHookHistoryRecorder(cs *store.ConfigStore, ps *store.PlayerStore, ac *AnticheatHandler, stop <-chan struct{}) {
 	const interval = 60 * time.Second
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	client := &http.Client{Timeout: 30 * time.Second}
+	hookOK := true // 上一次轮询的连接状态 (用于 在线->离线 转换告警)
 
 	for {
 		select {
@@ -179,11 +178,19 @@ func StartHookHistoryRecorder(cs *store.ConfigStore, ps *store.PlayerStore, stop
 			}
 			req, err := http.NewRequest(http.MethodGet, cc.PalHookURL+"/players", nil)
 			if err != nil {
+				if hookOK {
+					_ = ac.alerts.AddAlert("error", "server", "PalHook 连接失败: "+err.Error(), "")
+					hookOK = false
+				}
 				continue
 			}
 			req.SetBasicAuth("admin", cc.PalHookPassword)
 			resp, err := client.Do(req)
 			if err != nil {
+				if hookOK {
+					_ = ac.alerts.AddAlert("error", "server", "PalHook 连接失败: "+err.Error(), "")
+					hookOK = false
+				}
 				continue
 			}
 			body, _ := io.ReadAll(resp.Body)
@@ -194,10 +201,15 @@ func StartHookHistoryRecorder(cs *store.ConfigStore, ps *store.PlayerStore, stop
 			if json.Unmarshal(body, &pr) != nil {
 				continue
 			}
+			if !hookOK {
+				_ = ac.alerts.AddAlert("info", "server", "PalHook 已恢复连接", "")
+				hookOK = true
+			}
 
 			// 本轮在线的 uid; 上一轮在线但这轮不在的要标记离线,
 			// 否则历史列表里的人永远显示"在线"
 			nowOnline := make(map[string]bool, len(pr.Players))
+			snapshots := make([]PlayerSnapshot, 0, len(pr.Players))
 			for _, p := range pr.Players {
 				name, _ := p["name"].(string)
 				uid, _ := p["uid"].(string)
@@ -214,6 +226,15 @@ func StartHookHistoryRecorder(cs *store.ConfigStore, ps *store.PlayerStore, stop
 				_ = ps.UpsertPlayerSnapshot(uid, name, ip, platform, lvl)
 				// 在线时长累加: 每轮 +interval
 				_ = ps.AddPlaytime(uid, int64(interval.Seconds()))
+
+				snap := PlayerSnapshot{UID: uid, Name: name, IP: ip, Platform: platform, Level: lvl}
+				if v, ok := p["exp"].(float64); ok {
+					snap.Exp = int64(v)
+				}
+				if v, ok := p["ping"].(float64); ok {
+					snap.Ping = v
+				}
+				snapshots = append(snapshots, snap)
 			}
 
 			prevOnline, err := ps.GetOnlineUIDs()
@@ -225,6 +246,9 @@ func StartHookHistoryRecorder(cs *store.ConfigStore, ps *store.PlayerStore, stop
 					_ = ps.SetOffline(uid)
 				}
 			}
+
+			// 反作弊检测 (自动模式, 去重后只有新异常才产生标记)
+			_, _ = ac.RunChecks("auto", snapshots)
 		}
 	}
 }

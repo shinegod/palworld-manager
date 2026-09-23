@@ -196,5 +196,33 @@ func runMigrations(db *sql.DB) error {
 			return fmt.Errorf("exec migration: %w\nSQL: %s", err, m)
 		}
 	}
+
+	// 轻量列迁移: 早期版本的 anticheat_flags 表缺 resolved/action_taken 两列
+	type colMig struct{ table, column, ddl string }
+	for _, c := range []colMig{
+		{"anticheat_flags", "resolved", "ALTER TABLE anticheat_flags ADD COLUMN resolved INTEGER DEFAULT 0"},
+		{"anticheat_flags", "action_taken", "ALTER TABLE anticheat_flags ADD COLUMN action_taken TEXT DEFAULT ''"},
+	} {
+		rows, err := db.Query("PRAGMA table_info(" + c.table + ")")
+		if err != nil {
+			continue
+		}
+		has := false
+		for rows.Next() {
+			var cid, notnull, pk int
+			var name, ctype string
+			var dflt sql.NullString
+			if rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk) == nil && name == c.column {
+				has = true
+				break
+			}
+		}
+		rows.Close()
+		if !has {
+			if _, err := db.Exec(c.ddl); err != nil {
+				return fmt.Errorf("migrate %s.%s: %w", c.table, c.column, err)
+			}
+		}
+	}
 	return nil
 }

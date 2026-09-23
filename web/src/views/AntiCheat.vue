@@ -36,8 +36,8 @@
     </el-row>
 
     <el-alert type="info" :closable="false" style="margin-bottom: 16px">
-      反作弊扫描通过对比玩家快照来检测异常行为，例如等级跳跃、物品数量异常或可疑移动速度。
-      扫描使用 REST API 数据和数据库中的历史记录。
+      反作弊每 60 秒自动对比 PalHook 在线玩家快照: 等级超过上限 (80)、经验异常、同 IP 多账号在线。
+      也可手动触发立即扫描。
     </el-alert>
 
     <h3 style="color: var(--text-primary); margin-bottom: 12px">检测日志</h3>
@@ -130,7 +130,8 @@ function formatTime(ts: string): string {
 async function fetchFlags() {
   try {
     const res = await http.get('/anticheat/flags')
-    flags.value = (res.data as Flag[]) ?? []
+    flags.value = (res.data?.flags as Flag[]) ?? []
+    stats.totalScans = res.data?.total_scans ?? 0
     stats.totalFlags = flags.value.length
     stats.resolved = flags.value.filter((f) => f.resolved).length
     stats.pending = flags.value.filter((f) => !f.resolved).length
@@ -165,13 +166,14 @@ async function resolveFlag(flag: Flag) {
 
 async function banFlagged(flag: Flag) {
   try {
-    await http.post('/players/ban', { userId: flag.user_id, message: '反作弊: ' + flag.flag_type })
+    await http.post('/players/ban', { userid: flag.user_id, message: '反作弊: ' + flag.flag_type })
+    await http.post('/anticheat/flags/' + flag.id + '/resolve', { action: 'banned' })
     flag.resolved = true
     flag.action_taken = 'banned'
     ElMessage.success('玩家已封禁')
     await fetchFlags()
   } catch {
-    ElMessage.error('封禁失败')
+    ElMessage.error('封禁失败 (玩家可能已离线, 仍可在封禁列表手动添加)')
   }
 }
 
@@ -181,7 +183,12 @@ function saveConfig() {
   configVisible.value = false
 }
 
-onMounted(() => fetchFlags())
+let refreshTimer: ReturnType<typeof setInterval> | null = null
+
+onMounted(() => {
+  fetchFlags()
+  refreshTimer = setInterval(fetchFlags, 30000)
+})
 </script>
 
 <style scoped>

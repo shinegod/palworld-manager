@@ -57,6 +57,9 @@ func main() {
 	hookPlayers := handler.NewPalHookPlayersHandler(configStore, banStore, playerStore)
 	hookDash := handler.NewHookDashboardHandler(configStore)
 	ipInfo := handler.NewIPInfoHandler()
+	anticheatHandler := handler.NewAnticheatHandler(db, configStore)
+	alertHandler := handler.NewAlertHandler(db)
+	backupHandler := handler.NewBackupHandler(db, configStore)
 
 	// Router
 	gin.SetMode(gin.ReleaseMode)
@@ -88,9 +91,9 @@ func main() {
 		api.GET("/dashboard/realtime", hookDash.GetRealtime)
 		api.GET("/dashboard/trends", hookDash.GetTrends)
 		api.GET("/dashboard/info", hookDash.GetInfo)
-		api.GET("/dashboard/alerts", hookDash.GetAlerts)
-		api.POST("/dashboard/alerts/ack", hookDash.AckAlert)
-		api.POST("/dashboard/alerts/clear", hookDash.ClearAlerts)
+		api.GET("/dashboard/alerts", alertHandler.GetAlerts)
+		api.POST("/dashboard/alerts/ack", alertHandler.AckAlert)
+		api.POST("/dashboard/alerts/clear", alertHandler.ClearAlerts)
 
 		// Players (PalHook + 本地封禁记录)
 		api.GET("/players/online", hookPlayers.GetOnlinePlayers)
@@ -137,7 +140,19 @@ func main() {
 		api.POST("/events/:id/trigger", eventHandler.Trigger)
 
 		// AntiCheat 占位 (hook侧暂无数据)
-		api.GET("/anticheat/flags", func(c *gin.Context) { c.JSON(http.StatusOK, []any{}) })
+		api.GET("/anticheat/flags", anticheatHandler.GetFlags)
+		api.POST("/anticheat/scan", anticheatHandler.Scan)
+		api.POST("/anticheat/flags/:id/resolve", anticheatHandler.ResolveFlag)
+
+		// 备份/恢复/删档 (面板与PalServer同机部署时直接读写存档目录)
+		api.GET("/backups/config", backupHandler.GetConfig)
+		api.POST("/backups/config", backupHandler.SaveConfig)
+		api.GET("/backups/saves", backupHandler.ListSaves)
+		api.POST("/backups/create", backupHandler.Create)
+		api.GET("/backups/list", backupHandler.List)
+		api.POST("/backups/restore", backupHandler.Restore)
+		api.POST("/backups/delete", backupHandler.Delete)
+		api.POST("/backups/wipe", backupHandler.Wipe)
 	}
 
 	// Embedded frontend with SPA fallback
@@ -159,7 +174,7 @@ func main() {
 
 	// 后台历史快照轮询 (只打 PalHook /players, 60s一次)
 	historyStop := make(chan struct{})
-	go handler.StartHookHistoryRecorder(configStore, playerStore, historyStop)
+	go handler.StartHookHistoryRecorder(configStore, playerStore, anticheatHandler, historyStop)
 
 	// Start server
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Server.Port)
