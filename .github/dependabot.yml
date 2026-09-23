@@ -1,0 +1,21 @@
+version: 2
+updates:
+  # Go 依赖
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # 前端依赖
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # Actions 自身
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

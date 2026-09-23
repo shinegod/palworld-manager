@@ -1,0 +1,28 @@
+# CodeRabbit AI 代码审查配置
+# 使用前提: 在 GitHub Marketplace 安装 CodeRabbit 应用到本仓库
+# (https://github.com/apps/coderabbitai)
+language: "zh-CN"
+early_access: false
+reviews:
+  profile: "chill"
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  path_filters:
+    - "!web/dist/**"
+    - "!bin/**"
+  path_instructions:
+    - path: "palhook/**"
+      instructions: |
+        审查重点: 内存安全(远程内存读取必须走 safe_read_ptr/bulk_read, 禁止裸解引用)、
+        并发安全(共享状态要加锁)、崩溃防护(process_vm_readv/writev 而非直接指针)。
+    - path: "internal/**"
+      instructions: |
+        审查重点: SQL 注入(参数化查询)、路径穿越(文件操作校验)、错误处理、goroutine 泄漏。
+auto_review:
+  enabled: true
+  drafts: false
+chat:
+  auto_reply: true
