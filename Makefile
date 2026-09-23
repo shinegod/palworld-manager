@@ -9,10 +9,10 @@ build-frontend:
 	cd web && pnpm install && pnpm build
 
 build: build-frontend
-	go build -ldflags "$(LDFLAGS)" -o bin/palmanager ./cmd/palmanager
+	go build -trimpath -ldflags "$(LDFLAGS)" -o bin/palmanager ./cmd/palmanager
 
 build-linux: build-frontend
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "$(LDFLAGS)" -o bin/palmanager-linux-amd64 ./cmd/palmanager
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/palmanager-linux-amd64 ./cmd/palmanager
 
 dev:
 	go run ./cmd/palmanager -config configs/palmanager.example.yaml

@@ -68,7 +68,7 @@ jobs:
       - name: go vet
         run: go vet ./...
       - name: Build linux amd64
-        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o dist/palmanager-linux-amd64 ./cmd/palmanager
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/palmanager-linux-amd64 ./cmd/palmanager
       - uses: actions/upload-artifact@v4
         with:
           name: palmanager-linux-amd64
