@@ -22,7 +22,7 @@ jobs:
             /opt/rh/devtoolset-10/root/usr/bin/gcc -shared -fPIC -O2 -std=gnu17 -o /build/dist/libpalhook.so /build/palhook.c -lpthread -ldl"
 
       # 2. 前端 (embed 进面板二进制)
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 9
       - uses: actions/setup-node@v4
