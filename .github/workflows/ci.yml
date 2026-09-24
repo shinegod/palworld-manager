@@ -19,7 +19,7 @@ jobs:
           docker run --rm -v "$PWD":/build quay.io/pypa/manylinux2014_x86_64 bash -c "\
             /opt/rh/devtoolset-10/root/usr/bin/gcc -shared -fPIC -O2 -std=gnu17 -Wall -o /build/libpalhook.so /build/palhook.c -lpthread -ldl"
           ls -la libpalhook.so
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: libpalhook.so
           path: libpalhook.so
@@ -69,7 +69,7 @@ jobs:
         run: go vet ./...
       - name: Build linux amd64
         run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/palmanager-linux-amd64 ./cmd/palmanager
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: palmanager-linux-amd64
           path: dist/palmanager-linux-amd64
