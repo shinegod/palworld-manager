@@ -20,6 +20,7 @@ jobs:
         run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
       - name: Run golangci-lint
         run: |
+          set +e
           LOG=$($(go env GOPATH)/bin/golangci-lint run --timeout=10m --out-format=github-actions 2>&1)
           CODE=$?
           echo "$LOG"
