@@ -42,7 +42,7 @@ func (s *PlayerStore) GetHistory(limit, offset int) ([]model.Player, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var players []model.Player
 	for rows.Next() {
@@ -97,7 +97,7 @@ func (s *PlayerStore) GetOnlineUIDs() (map[string]time.Time, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	result := make(map[string]time.Time)
 	for rows.Next() {
 		var uid string

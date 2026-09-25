@@ -35,7 +35,7 @@ func (s *BanStore) GetBans(limit, offset int) ([]Ban, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var bans []Ban
 	for rows.Next() {

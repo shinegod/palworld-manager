@@ -27,7 +27,7 @@ jobs:
             elif [ -x /opt/rh/devtoolset-11/root/usr/bin/gcc ]; then GCC=/opt/rh/devtoolset-11/root/usr/bin/gcc;
             else GCC=gcc; fi
             echo "using $GCC"
-            $GCC -shared -fPIC -O2 -std=gnu17 -Wall -o /build/libpalhook.so /build/palhook.c -lpthread -ldl'
+            $GCC -shared -fPIC -O2 -std=gnu17 -Wall -o /build/libpalhook.so /build/palhook/palhook.c -lpthread -ldl'
           ls -la libpalhook.so
       - uses: actions/upload-artifact@v4
         with:

@@ -217,7 +217,7 @@ func runMigrations(db *sql.DB) error {
 				break
 			}
 		}
-		rows.Close()
+		_ = rows.Close()
 		if !has {
 			if _, err := db.Exec(c.ddl); err != nil {
 				return fmt.Errorf("migrate %s.%s: %w", c.table, c.column, err)

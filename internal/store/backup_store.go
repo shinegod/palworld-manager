@@ -20,7 +20,7 @@ func (s *BackupStore) List(limit int) ([]model.Backup, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []model.Backup
 	for rows.Next() {
 		var b model.Backup

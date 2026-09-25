@@ -49,7 +49,7 @@ func (s *EventScheduler) hookPost(path string, payload any) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("PalHook %s 状态码 %d", path, resp.StatusCode)
 	}
@@ -209,7 +209,7 @@ func (s *EventScheduler) tick() {
 			list = append(list, e)
 		}
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	now := time.Now()
 	for _, e := range list {

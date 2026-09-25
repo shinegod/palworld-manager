@@ -69,7 +69,7 @@ func (h *PalHookPlayersHandler) fetchHookPlayers() ([]hookPlayer, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var out struct {
 		Players []hookPlayer `json:"players"`
 	}
@@ -85,8 +85,8 @@ func (h *PalHookPlayersHandler) kickByName(name string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
 }
 

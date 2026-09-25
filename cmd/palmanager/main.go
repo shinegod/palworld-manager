@@ -38,7 +38,7 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("init database")
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	configStore := store.NewConfigStore(db)
 
@@ -166,7 +166,7 @@ func main() {
 	r.NoRoute(func(c *gin.Context) {
 		f, err := frontendFS.Open(c.Request.URL.Path[1:])
 		if err == nil {
-			f.Close()
+			_ = f.Close()
 			fileServer.ServeHTTP(c.Writer, c.Request)
 			return
 		}

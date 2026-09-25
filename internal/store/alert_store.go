@@ -48,7 +48,7 @@ func (s *AlertStore) ListAlerts(limit int) ([]Alert, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []Alert
 	for rows.Next() {
 		var a Alert

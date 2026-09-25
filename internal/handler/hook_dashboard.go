@@ -40,7 +40,7 @@ func (h *HookDashboardHandler) hookGet(path string) ([]byte, int, error) {
 	if err != nil {
 		return nil, http.StatusBadGateway, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	return body, resp.StatusCode, nil
 }
@@ -194,7 +194,7 @@ func StartHookHistoryRecorder(cs *store.ConfigStore, ps *store.PlayerStore, ac *
 				continue
 			}
 			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			var pr struct {
 				Players []map[string]any `json:"players"`
 			}

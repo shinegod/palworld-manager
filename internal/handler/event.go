@@ -55,7 +55,7 @@ func (h *EventHandler) List(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	events := make([]EventRow, 0)
 	for rows.Next() {
@@ -154,7 +154,7 @@ func (h *EventHandler) Trigger(c *gin.Context) {
 
 	// 真正执行动作 (广播/聊天/重启), 不再只是标记一下
 	errs := h.scheduler.ExecuteActions(actions)
-	h.db.Exec(`UPDATE events SET last_run=? WHERE id=?`, time.Now().Format(time.RFC3339), id)
+	_, _ = h.db.Exec(`UPDATE events SET last_run=? WHERE id=?`, time.Now().Format(time.RFC3339), id)
 
 	if len(errs) > 0 {
 		msgs := make([]string, 0, len(errs))

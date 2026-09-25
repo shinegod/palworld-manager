@@ -64,7 +64,7 @@ func (s *AnticheatStore) ListFlags(limit int) ([]AnticheatFlag, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []AnticheatFlag
 	for rows.Next() {
 		var f AnticheatFlag

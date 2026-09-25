@@ -69,7 +69,7 @@ func (h *BackupHandler) hookDo(method, path string, body io.Reader, clen int64) 
 	if err != nil {
 		return nil, 0, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	return data, resp.StatusCode, nil
 }
@@ -173,19 +173,19 @@ func (h *BackupHandler) Create(c *gin.Context) {
 		resp, err := h.big.Do(req)
 		if err != nil || resp.StatusCode != http.StatusOK {
 			if resp != nil {
-				resp.Body.Close()
+				_ = resp.Body.Close()
 			}
 			skipped++
 			continue
 		}
 		w, err := zw.Create(rel)
 		if err != nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			skipped++
 			continue
 		}
 		_, _ = io.Copy(w, resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}
 	_ = zw.Close()
 	_ = zf.Close()
@@ -252,7 +252,7 @@ func (h *BackupHandler) Restore(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "打开备份失败: " + err.Error()})
 		return
 	}
-	defer zr.Close()
+	defer func() { _ = zr.Close() }()
 	cc := h.cs.GetConnectionConfig()
 	uploaded := 0
 	for _, f := range zr.File {
@@ -264,7 +264,7 @@ func (h *BackupHandler) Restore(c *gin.Context) {
 			continue
 		}
 		data, err := io.ReadAll(io.LimitReader(rc, 512<<20))
-		rc.Close()
+		_ = rc.Close()
 		if err != nil {
 			continue
 		}
@@ -279,7 +279,7 @@ func (h *BackupHandler) Restore(c *gin.Context) {
 		if err != nil {
 			continue
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode == http.StatusOK {
 			uploaded++
 		}
@@ -388,7 +388,7 @@ func (h *BackupHandler) createBackupInternal(note string) error {
 		resp, err := h.big.Do(req)
 		if err != nil || resp.StatusCode != http.StatusOK {
 			if resp != nil {
-				resp.Body.Close()
+				_ = resp.Body.Close()
 			}
 			continue
 		}
@@ -397,7 +397,7 @@ func (h *BackupHandler) createBackupInternal(note string) error {
 			_, _ = io.Copy(w, resp.Body)
 			ok++
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}
 	_ = zw.Close()
 	_ = zf.Close()

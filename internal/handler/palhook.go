@@ -57,7 +57,7 @@ func (h *PalHookHandler) proxy(c *gin.Context, method, path string) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "PalHook连接失败: " + err.Error()})
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	respBody, _ := io.ReadAll(resp.Body)
 	c.Data(resp.StatusCode, "application/json", respBody)
 }
