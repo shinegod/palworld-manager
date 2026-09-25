@@ -16,8 +16,18 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build universal libpalhook.so
         run: |
-          docker run --rm -v "$PWD":/build quay.io/pypa/manylinux2014_x86_64 bash -c "\
-            /opt/rh/devtoolset-10/root/usr/bin/gcc -shared -fPIC -O2 -std=gnu17 -Wall -o /build/libpalhook.so /build/palhook.c -lpthread -ldl"
+          IMAGE=quay.io/pypa/manylinux2014_x86_64
+          for i in 1 2 3 4; do
+            docker pull "$IMAGE" && break
+            echo "pull attempt $i failed, retrying in 20s..."
+            sleep 20
+          done
+          docker run --rm -v "$PWD":/build "$IMAGE" bash -c '
+            if [ -x /opt/rh/devtoolset-10/root/usr/bin/gcc ]; then GCC=/opt/rh/devtoolset-10/root/usr/bin/gcc;
+            elif [ -x /opt/rh/devtoolset-11/root/usr/bin/gcc ]; then GCC=/opt/rh/devtoolset-11/root/usr/bin/gcc;
+            else GCC=gcc; fi
+            echo "using $GCC"
+            $GCC -shared -fPIC -O2 -std=gnu17 -Wall -o /build/libpalhook.so /build/palhook.c -lpthread -ldl'
           ls -la libpalhook.so
       - uses: actions/upload-artifact@v4
         with:

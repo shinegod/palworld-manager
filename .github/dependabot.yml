@@ -7,15 +7,29 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
 
-  # 前端依赖
+  # 前端依赖 (忽略大版本升级: 会破坏 vue-tsc/vite 构建)
   - package-ecosystem: npm
     directory: /web
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@vueuse/core"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "vite"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "vue"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "vue-tsc"
+        update-types: ["version-update:semver-major"]
 
-  # Actions 自身
+  # Actions 自身 (忽略大版本升级)
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
