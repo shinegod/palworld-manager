@@ -19,4 +19,12 @@ jobs:
       - name: Install golangci-lint
         run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
       - name: Run golangci-lint
-        run: $(go env GOPATH)/bin/golangci-lint run --timeout=5m --out-format=github-actions
+        run: |
+          LOG=$($(go env GOPATH)/bin/golangci-lint run --timeout=10m --out-format=github-actions 2>&1)
+          CODE=$?
+          echo "$LOG"
+          if [ $CODE -ne 0 ]; then
+            FIRST=$(echo "$LOG" | grep -vE '^::' | head -3 | tr '\n' ' ' | cut -c1-300)
+            echo "::error file=.github/workflows/lint.yml::lint failed: $FIRST"
+            exit $CODE
+          fi
